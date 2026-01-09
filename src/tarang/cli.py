@@ -1,42 +1,135 @@
 """
-Tarang CLI - Command line interface for the AI coding agent.
+Tarang CLI - Thin client for the AI coding agent.
+
+The CLI handles local operations (files, shell) while the backend
+handles all reasoning and orchestration.
 
 Usage:
-    tarang run "create a hello world app"
-    tarang run "explain how authentication works"
-    tarang init my-project
-    tarang resume
-    vibe status
+    tarang login                      # Authenticate with GitHub
+    tarang config --openrouter-key    # Set API key
+    tarang run "create a hello world" # Run instruction
+    tarang                             # Interactive mode
 """
 from __future__ import annotations
 
 import asyncio
-import os
+import shutil
 import sys
 from pathlib import Path
 
 import click
 
 from tarang import __version__
-from tarang.orchestrator import (
-    execute_instruction,
-    resume_execution,
-    get_execution_status,
-    check_framework,
-)
-from tarang.memory.project_memory import ProjectMemory
-from tarang.tools.shell_tools import ProjectInitTool
+from tarang.client import TarangAPIClient, TarangAuth, TarangResponse
+from tarang.client.api_client import LocalContext
+from tarang.context import SkeletonGenerator
+from tarang.executor import DiffApplicator, ShadowLinter
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version=__version__, prog_name="Tarang")
-def cli():
+@click.pass_context
+def cli(ctx):
     """
-    Tarang v2 - AI Coding Agent with ManagerAgent Architecture.
+    Tarang - AI Coding Agent.
 
-    An autonomous coding agent that can explore, plan, and build software projects.
+    A thin CLI that connects to the Tarang backend for AI-powered coding.
+
+    Quick start:
+        tarang login                   # Authenticate
+        tarang config --openrouter-key YOUR_KEY
+        tarang run "explain the project"
     """
-    pass
+    # If no subcommand, start interactive session
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(run)
+
+
+@cli.command()
+def login():
+    """
+    Authenticate with Tarang via GitHub.
+
+    Opens a browser window for OAuth authentication.
+    Your token is stored securely in ~/.tarang/config.json
+    """
+    auth = TarangAuth()
+
+    if auth.is_authenticated():
+        click.echo("Already logged in.")
+        if not click.confirm("Login again?"):
+            return
+
+    click.echo("Starting authentication...")
+
+    try:
+        asyncio.run(auth.login())
+        click.echo("\nLogin successful!")
+        click.echo("Your credentials are saved in ~/.tarang/config.json")
+
+        if not auth.has_openrouter_key():
+            click.echo("\nNext step: Set your OpenRouter API key:")
+            click.echo("  tarang config --openrouter-key YOUR_KEY")
+
+    except TimeoutError:
+        click.echo("\nAuthentication timed out. Please try again.", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"\nAuthentication failed: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.option(
+    "--openrouter-key", "-k",
+    help="Set your OpenRouter API key",
+)
+@click.option(
+    "--backend-url", "-u",
+    help="Set custom backend URL (default: https://api.devtarang.ai)",
+)
+@click.option(
+    "--show",
+    is_flag=True,
+    help="Show current configuration",
+)
+def config(openrouter_key: str, backend_url: str, show: bool):
+    """
+    Configure Tarang settings.
+
+    Set your OpenRouter API key for LLM access:
+        tarang config --openrouter-key sk-or-...
+
+    View current config:
+        tarang config --show
+    """
+    auth = TarangAuth()
+
+    if show:
+        creds = auth.load_credentials() or {}
+        click.echo(f"\nTarang Configuration (~/.tarang/config.json)")
+        click.echo(f"{'='*50}")
+        click.echo(f"Token: {'configured' if creds.get('token') else 'not set'}")
+        click.echo(f"OpenRouter Key: {'configured' if creds.get('openrouter_key') else 'not set'}")
+        if creds.get("backend_url"):
+            click.echo(f"Backend URL: {creds.get('backend_url')}")
+        click.echo()
+        return
+
+    if openrouter_key:
+        if not openrouter_key.startswith("sk-or-"):
+            click.echo("Warning: OpenRouter keys usually start with 'sk-or-'", err=True)
+
+        auth.save_openrouter_key(openrouter_key)
+        click.echo("OpenRouter API key saved.")
+
+    if backend_url:
+        auth.save_credentials(backend_url=backend_url)
+        click.echo(f"Backend URL set to: {backend_url}")
+
+    if not openrouter_key and not backend_url:
+        click.echo("No configuration changes made.")
+        click.echo("Use --help to see available options.")
 
 
 @cli.command()
@@ -44,46 +137,58 @@ def cli():
 @click.option(
     "--project-dir", "-p",
     default=".",
-    help="Project directory to operate in (default: current directory)",
+    help="Project directory (default: current directory)",
 )
 @click.option(
-    "--config", "-c",
-    default="coder",
-    help="Agent config to use (coder, explorer, orchestrator)",
+    "--no-lint",
+    is_flag=True,
+    help="Skip shadow linting after applying changes",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show changes without applying them",
 )
 @click.option(
     "--verbose", "-v",
     is_flag=True,
-    help="Enable verbose output with agent thinking",
+    help="Enable verbose output",
 )
 @click.option(
     "--once",
     is_flag=True,
     help="Run single instruction and exit (no interactive mode)",
 )
-def run(instruction: str, project_dir: str, config: str, verbose: bool, once: bool):
+def run(
+    instruction: str,
+    project_dir: str,
+    no_lint: bool,
+    dry_run: bool,
+    verbose: bool,
+    once: bool,
+):
     """
-    Start Tarang - AI coding assistant.
+    Run Tarang AI coding assistant.
 
     Without instruction: starts interactive mode
-    With instruction: runs it, then enters interactive mode (use --once to exit after)
+    With instruction: runs it and enters interactive mode (use --once to exit)
 
     Examples:
-
         tarang run                              # Interactive mode
         tarang run "explain the project"        # Run then continue chatting
         tarang run "fix linter errors" --once   # Run and exit
+        tarang run "add login" --dry-run        # Preview changes
     """
-    # Check framework availability
-    status = check_framework()
-    if not status.get("available"):
-        click.echo(f"Error: {status.get('error')}", err=True)
-        click.echo("Install with: pip install agent-framework", err=True)
+    # Check authentication
+    auth = TarangAuth()
+
+    if not auth.is_authenticated():
+        click.echo("Not logged in. Run 'tarang login' first.", err=True)
         sys.exit(1)
 
-    if not status.get("configured"):
-        click.echo(f"Error: {status.get('error')}", err=True)
-        click.echo("Set your API key: export OPENROUTER_API_KEY=your_key", err=True)
+    if not auth.has_openrouter_key():
+        click.echo("OpenRouter key not set.", err=True)
+        click.echo("Run: tarang config --openrouter-key YOUR_KEY", err=True)
         sys.exit(1)
 
     # Resolve project directory
@@ -92,81 +197,100 @@ def run(instruction: str, project_dir: str, config: str, verbose: bool, once: bo
         click.echo(f"Error: Project directory not found: {project_dir}", err=True)
         sys.exit(1)
 
+    # Initialize components
+    creds = auth.load_credentials()
+    client = TarangAPIClient(creds.get("backend_url"))
+    client.token = creds.get("token")
+    client.openrouter_key = creds.get("openrouter_key")
+
+    # Generate project skeleton
     click.echo(f"\n{'='*60}")
     click.echo(f"Tarang v{__version__}")
     click.echo(f"Project: {project_path}")
-    click.echo(f"Config: {config}")
-    click.echo(f"{'='*60}\n")
+    click.echo(f"{'='*60}")
 
+    if verbose:
+        click.echo("\nScanning project...")
+
+    skeleton_gen = SkeletonGenerator(project_path)
+    skeleton = skeleton_gen.generate()
+
+    click.echo(f"Files: {skeleton.total_files} | Lines: {skeleton.total_lines}\n")
+
+    # Build context
+    context = LocalContext(
+        project_root=str(project_path),
+        skeleton=skeleton.to_dict(),
+    )
+
+    # Initialize executor
+    diff_applicator = DiffApplicator(project_path)
+    linter = ShadowLinter(project_path)
+
+    session_id = None
     conversation_history = []
 
-    def run_instruction(instr: str) -> str:
+    async def run_instruction(instr: str) -> str:
         """Run a single instruction and return response."""
-        # Build context from conversation history
-        context_prefix = ""
-        if conversation_history:
-            context_prefix = "Previous conversation:\n"
-            for turn in conversation_history[-3:]:
-                context_prefix += f"User: {turn['user']}\n"
-                context_prefix += f"Assistant: {turn['assistant'][:300]}...\n\n"
-            context_prefix += "Current request:\n"
+        nonlocal session_id, context
 
-        full_instruction = context_prefix + instr
+        # Add conversation history to context
+        context.history = conversation_history[-6:]  # Last 3 exchanges
 
-        result = asyncio.run(execute_instruction(
-            instruction=full_instruction,
-            project_dir=str(project_path),
-            config_name=config,
-            verbose=verbose,
-            save_state=True,
-        ))
+        click.echo("Thinking...")
 
-        if "error" in result:
-            click.echo(f"\nError: {result['error']}", err=True)
+        response = await client.execute(
+            instruction=instr,
+            context=context,
+            session_id=session_id,
+        )
+
+        session_id = response.session_id
+
+        # Handle response types
+        if response.type == "error":
+            click.echo(f"\nError: {response.error}", err=True)
             return ""
 
-        # Extract response - check multiple possible locations
-        agent_result = result.get("result", {})
-        response_text = ""
+        # Show thought process if verbose
+        if verbose and response.thought_process:
+            click.echo(f"\n[Thinking] {response.thought_process[:200]}...")
 
-        if isinstance(agent_result, dict):
-            # Try multiple keys for the response
-            summary = (
-                agent_result.get("human_readable_summary") or
-                agent_result.get("final_answer") or
-                agent_result.get("response") or
-                agent_result.get("summary") or
-                agent_result.get("message")
+        # Handle edits
+        if response.type == "edits" and response.edits:
+            return await _apply_edits(
+                response,
+                diff_applicator,
+                linter,
+                client,
+                no_lint,
+                dry_run,
             )
-            if not summary:
-                # Check nested payload
-                payload = agent_result.get("payload", {})
-                if isinstance(payload, dict):
-                    summary = (
-                        payload.get("message") or
-                        payload.get("response") or
-                        payload.get("final_answer")
-                    )
-            if summary:
-                response_text = summary
-                click.echo(f"\n{'─'*60}")
-                click.echo(summary)
-                click.echo(f"{'─'*60}\n")
-        elif isinstance(agent_result, str) and agent_result:
-            response_text = agent_result
-            click.echo(f"\n{'─'*60}")
-            click.echo(agent_result)
-            click.echo(f"{'─'*60}\n")
 
-        return response_text
+        # Handle commands
+        if response.type == "command" and response.commands:
+            return await _run_commands(response, project_path)
+
+        # Handle message
+        if response.message:
+            click.echo(f"\n{'─'*60}")
+            click.echo(response.message)
+            click.echo(f"{'─'*60}\n")
+            return response.message
+
+        return ""
 
     try:
         # Run initial instruction if provided
         if instruction:
-            response = run_instruction(instruction)
+            response = asyncio.run(run_instruction(instruction))
             conversation_history.append({
-                "user": instruction,
-                "assistant": response or "Task completed"
+                "role": "user",
+                "content": instruction,
+            })
+            conversation_history.append({
+                "role": "assistant",
+                "content": response or "Task completed",
             })
 
             if once:
@@ -179,7 +303,12 @@ def run(instruction: str, project_dir: str, config: str, verbose: bool, once: bo
 
         while not once:
             try:
-                user_input = click.prompt("You", prompt_suffix=" > ", default="", show_default=False)
+                user_input = click.prompt(
+                    "You",
+                    prompt_suffix=" > ",
+                    default="",
+                    show_default=False,
+                )
 
                 if not user_input.strip():
                     continue
@@ -192,11 +321,19 @@ def run(instruction: str, project_dir: str, config: str, verbose: bool, once: bo
                     conversation_history.clear()
                     click.echo("History cleared.\n")
                     continue
+                elif cmd == "status":
+                    click.echo(f"Session: {session_id or 'None'}")
+                    click.echo(f"History: {len(conversation_history)} messages\n")
+                    continue
 
-                response = run_instruction(user_input)
+                response = asyncio.run(run_instruction(user_input))
                 conversation_history.append({
-                    "user": user_input,
-                    "assistant": response or "Task completed"
+                    "role": "user",
+                    "content": user_input,
+                })
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": response or "Task completed",
                 })
 
             except KeyboardInterrupt:
@@ -211,261 +348,206 @@ def run(instruction: str, project_dir: str, config: str, verbose: bool, once: bo
         sys.exit(130)
     except Exception as e:
         click.echo(f"\nError: {e}", err=True)
+        if verbose:
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
 
 
-@cli.command()
-@click.option(
-    "--project-dir", "-p",
-    default=".",
-    help="Project directory to resume in",
-)
-@click.option(
-    "--verbose", "-v",
-    is_flag=True,
-    help="Enable verbose output",
-)
-def resume(project_dir: str, verbose: bool):
-    """
-    Resume a previous execution from saved state.
+async def _apply_edits(
+    response: TarangResponse,
+    diff_applicator: DiffApplicator,
+    linter: ShadowLinter,
+    client: TarangAPIClient,
+    no_lint: bool,
+    dry_run: bool,
+) -> str:
+    """Apply edits from backend response."""
+    click.echo(f"\n{'─'*60}")
+    click.echo(f"Applying {len(response.edits)} edit(s):")
 
-    If Tarang was interrupted or encountered an error, use this command
-    to continue from where it left off.
+    results = []
+    for edit in response.edits:
+        click.echo(f"  • {edit.file}: {edit.description}")
 
-    Examples:
+        if dry_run:
+            if edit.content:
+                click.echo(f"    [DRY-RUN] Would write {len(edit.content)} chars")
+            elif edit.search and edit.replace:
+                click.echo(f"    [DRY-RUN] Would replace: {edit.search[:50]}...")
+            elif edit.diff:
+                click.echo(f"    [DRY-RUN] Would apply diff")
+            continue
 
-        tarang resume              # Resume in current directory
-        tarang resume -p ./myapp   # Resume in specific project
-    """
-    status = check_framework()
-    if not status.get("available") or not status.get("configured"):
-        click.echo(f"Error: {status.get('error')}", err=True)
-        sys.exit(1)
-
-    project_path = Path(project_dir).resolve()
-
-    # Check for resumable state before starting
-    state_info = get_execution_status(str(project_path))
-    if state_info.get("status") == "no_execution":
-        click.echo("No execution state found to resume.")
-        click.echo("Run 'tarang run \"<instruction>\"' to start a new task.")
-        sys.exit(0)
-
-    if not state_info.get("can_resume"):
-        click.echo(f"Cannot resume: execution status is '{state_info.get('status')}'")
-        if state_info.get("status") == "completed":
-            click.echo("Task already completed. Run 'tarang run' to start a new task.")
+        # Apply the edit
+        if edit.content:
+            result = diff_applicator.apply_content(edit.file, edit.content)
+        elif edit.search and edit.replace:
+            result = diff_applicator.apply_search_replace(
+                edit.file, edit.search, edit.replace
+            )
+        elif edit.diff:
+            result = diff_applicator.apply_diff(edit.file, edit.diff)
         else:
-            click.echo("Run 'tarang reset' to clear state, then 'tarang run' to start fresh.")
-        sys.exit(0)
+            click.echo(f"    [SKIP] No content to apply")
+            continue
 
-    click.echo(f"\n{'='*60}")
-    click.echo(f"Resuming Tarang execution")
-    click.echo(f"Project: {project_path}")
-    click.echo(f"{'='*60}")
-    click.echo(f"\nInstruction: {state_info.get('instruction', 'Unknown')}")
-    click.echo(f"Progress: {state_info.get('progress', 'Starting...')}")
+        results.append(result)
+
+        if result.success:
+            click.echo(f"    ✓ Applied")
+        else:
+            click.echo(f"    ✗ Failed: {result.error}")
+
+    if dry_run:
+        click.echo(f"{'─'*60}")
+        click.echo("[DRY-RUN] No changes made.\n")
+        return "Dry run completed"
+
+    # Run linting
+    lint_errors = []
+    if not no_lint and results:
+        click.echo("\nVerifying changes...")
+
+        for result in results:
+            if result.success:
+                lint_result = linter.lint_file(result.path)
+                if not lint_result.success:
+                    lint_errors.extend(lint_result.errors)
+                    click.echo(f"  ✗ Lint errors in {result.path}")
+
+    # Report feedback to backend
+    success = len(lint_errors) == 0
+    if response.session_id:
+        await client.report_feedback(
+            session_id=response.session_id,
+            success=success,
+            applied_edits=[r.path for r in results if r.success],
+            lint_output="\n".join(lint_errors) if lint_errors else None,
+        )
+
     click.echo(f"{'─'*60}\n")
 
-    try:
-        result = asyncio.run(resume_execution(
-            project_dir=str(project_path),
-            verbose=verbose,
-        ))
+    if lint_errors:
+        return f"Applied with {len(lint_errors)} lint error(s)"
+    return f"Applied {len([r for r in results if r.success])} edit(s)"
 
-        if "error" in result:
-            click.echo(f"\nError: {result['error']}", err=True)
-            sys.exit(1)
 
-        if "message" in result:
-            click.echo(f"\n{result['message']}")
+async def _run_commands(response: TarangResponse, project_path: Path) -> str:
+    """Run shell commands from backend response."""
+    import subprocess
 
-        # Show result summary if available
-        agent_result = result.get("result", {})
-        if isinstance(agent_result, dict):
-            summary = (
-                agent_result.get("human_readable_summary") or
-                agent_result.get("final_answer") or
-                agent_result.get("response")
+    click.echo(f"\n{'─'*60}")
+    click.echo(f"Running {len(response.commands)} command(s):")
+
+    for cmd in response.commands:
+        click.echo(f"\n$ {cmd.command}")
+
+        if cmd.description:
+            click.echo(f"  ({cmd.description})")
+
+        try:
+            result = subprocess.run(
+                cmd.command,
+                shell=True,
+                cwd=project_path,
+                capture_output=True,
+                timeout=cmd.timeout,
             )
-            if summary:
-                click.echo(f"\n{'─'*60}")
-                click.echo(summary)
-                click.echo(f"{'─'*60}")
 
-        click.echo(f"\n{'='*60}")
-        click.echo("Execution completed")
-        click.echo(f"{'='*60}\n")
+            if result.stdout:
+                click.echo(result.stdout.decode()[:500])
+            if result.stderr:
+                click.echo(result.stderr.decode()[:500], err=True)
 
-    except KeyboardInterrupt:
-        click.echo("\n\nInterrupted by user. State saved.")
-        click.echo("Run 'tarang resume' to continue later.")
-        sys.exit(130)
+            if result.returncode != 0:
+                click.echo(f"  [Exit code: {result.returncode}]")
+
+        except subprocess.TimeoutExpired:
+            click.echo("  [Timed out]", err=True)
+        except Exception as e:
+            click.echo(f"  [Error: {e}]", err=True)
+
+    click.echo(f"{'─'*60}\n")
+    return f"Ran {len(response.commands)} command(s)"
+
+
+@cli.command()
+@click.argument("query", required=True)
+def ask(query: str):
+    """
+    Quick question (no code generation).
+
+    For fast answers about coding concepts without project context.
+
+    Example:
+        tarang ask "what is a closure in Python?"
+    """
+    auth = TarangAuth()
+
+    if not auth.has_openrouter_key():
+        click.echo("OpenRouter key not set.", err=True)
+        click.echo("Run: tarang config --openrouter-key YOUR_KEY", err=True)
+        sys.exit(1)
+
+    creds = auth.load_credentials()
+    client = TarangAPIClient(creds.get("backend_url"))
+    client.openrouter_key = creds.get("openrouter_key")
+
+    try:
+        answer = asyncio.run(client.quick_ask(query))
+        click.echo(f"\n{answer}\n")
     except Exception as e:
-        click.echo(f"\nError: {e}", err=True)
+        click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
 
 @cli.command()
-@click.argument("project_name")
-@click.option(
-    "--type", "-t",
-    "project_type",
-    default="python",
-    type=click.Choice(["python", "node", "web", "generic"]),
-    help="Project type (default: python)",
-)
-def init(project_name: str, project_type: str):
+def status():
     """
-    Initialize a new project with common structure.
+    Show Tarang status and configuration.
 
-    Creates a new directory with appropriate files based on project type.
-
-    Examples:
-
-        tarang init my-app
-
-        tarang init my-api --type node
-
-        tarang init website --type web
+    Displays authentication status and connectivity.
     """
-    project_path = Path(project_name).resolve()
-
-    if project_path.exists():
-        click.echo(f"Error: Directory already exists: {project_name}", err=True)
-        sys.exit(1)
-
-    # Create the directory
-    project_path.mkdir(parents=True)
-
-    # Initialize with ProjectInitTool
-    async def do_init():
-        tool = ProjectInitTool(str(project_path))
-        return await tool.execute(project_type=project_type, name=project_name)
-
-    result = asyncio.run(do_init())
-
-    if "error" in result:
-        click.echo(f"Error: {result['error']}", err=True)
-        sys.exit(1)
-
-    click.echo(f"\nCreated {project_type} project: {project_name}")
-    click.echo(f"\nDirectories created:")
-    for d in result.get("directories_created", []):
-        click.echo(f"  - {d}/")
-
-    click.echo(f"\nFiles created:")
-    for f in result.get("files_created", []):
-        click.echo(f"  - {f}")
-
-    click.echo(f"\nNext steps:")
-    click.echo(f"  cd {project_name}")
-    click.echo(f"  tarang run \"<your instruction>\"")
-
-
-@cli.command()
-@click.option(
-    "--project-dir", "-p",
-    default=".",
-    help="Project directory to check",
-)
-def status(project_dir: str):
-    """
-    Show the status of Tarang in the current project.
-
-    Displays saved state, progress, and whether execution can be resumed.
-    """
-    project_path = Path(project_dir).resolve()
-
-    # Check for .tarang directory
-    tarang_dir = project_path / ".tarang"
-    if not tarang_dir.exists():
-        click.echo(f"No Tarang state found in {project_path}")
-        click.echo("Run 'tarang run \"<instruction>\"' to start.")
-        return
-
-    # Get execution status using new state manager
-    state_info = get_execution_status(str(project_path))
+    auth = TarangAuth()
+    creds = auth.load_credentials() or {}
 
     click.echo(f"\n{'='*60}")
-    click.echo(f"Tarang Status")
-    click.echo(f"Project: {project_path}")
+    click.echo(f"Tarang v{__version__} Status")
     click.echo(f"{'='*60}\n")
 
-    if state_info.get("status") == "no_execution":
-        click.echo(state_info.get("message", "No execution state found."))
-        return
+    # Auth status
+    if auth.is_authenticated():
+        click.echo("Authentication: ✓ Logged in")
+    else:
+        click.echo("Authentication: ✗ Not logged in")
+        click.echo("  Run: tarang login")
 
-    instruction = state_info.get("instruction", "Unknown")
-    status_val = state_info.get("status", "unknown")
-    progress = state_info.get("progress", "")
-    can_resume = state_info.get("can_resume", False)
+    # OpenRouter key
+    if auth.has_openrouter_key():
+        key = creds.get("openrouter_key", "")
+        click.echo(f"OpenRouter Key: ✓ Configured ({key[:8]}...)")
+    else:
+        click.echo("OpenRouter Key: ✗ Not set")
+        click.echo("  Run: tarang config --openrouter-key YOUR_KEY")
 
-    click.echo(f"Instruction: {instruction}")
-    click.echo(f"Status: {status_val}")
+    # Backend URL
+    backend_url = creds.get("backend_url", TarangAPIClient.DEFAULT_BASE_URL)
+    click.echo(f"Backend URL: {backend_url}")
 
-    if progress:
-        click.echo(f"Progress: {progress}")
-
-    if status_val == "failed":
-        click.echo("\nExecution failed.")
-        click.echo("Run 'tarang run \"<instruction>\"' to start fresh.")
-
-    elif status_val in ("running", "paused"):
-        click.echo("\nExecution was interrupted.")
-        if can_resume:
-            click.echo("Run 'tarang resume' to continue from checkpoint.")
+    # Test connectivity
+    click.echo("\nTesting connection...")
+    try:
+        import httpx
+        response = httpx.get(f"{backend_url}/health", timeout=5)
+        if response.status_code == 200:
+            click.echo("Backend: ✓ Connected")
         else:
-            click.echo("State has expired. Run 'tarang run' to start fresh.")
+            click.echo(f"Backend: ⚠ Status {response.status_code}")
+    except Exception as e:
+        click.echo(f"Backend: ✗ Cannot connect ({e})")
 
-    elif status_val == "completed":
-        click.echo("\nExecution completed successfully.")
-
-    # Show legacy memory info if available
-    memory = ProjectMemory(str(project_path))
-    phases = memory.get_completed_phases()
-    if phases:
-        click.echo(f"\nCompleted phases: {len(phases)}")
-        for phase in phases:
-            click.echo(f"  - {phase}")
-
-
-@cli.command()
-@click.option(
-    "--project-dir", "-p",
-    default=".",
-    help="Project directory to reset",
-)
-@click.option(
-    "--force", "-f",
-    is_flag=True,
-    help="Don't ask for confirmation",
-)
-def reset(project_dir: str, force: bool):
-    """
-    Reset Tarang execution state for this project.
-
-    Clears execution state so you can start fresh without removing all project data.
-    Use 'tarang clean' to remove all Tarang data including memory.
-    """
-    from tarang.state.execution_state import ExecutionStateManager
-
-    project_path = Path(project_dir).resolve()
-    state_manager = ExecutionStateManager(str(project_path))
-
-    # Check if there's state to reset
-    state = state_manager.load()
-    if not state:
-        click.echo("No execution state to reset.")
-        return
-
-    if not force:
-        click.echo(f"Current state: {state.status}")
-        click.echo(f"Instruction: {state.instruction[:80]}...")
-        click.confirm("Reset execution state?", abort=True)
-
-    state_manager.clear()
-    click.echo("Execution state reset. Ready for a fresh start.")
+    click.echo()
 
 
 @cli.command()
@@ -483,240 +565,47 @@ def clean(project_dir: str, force: bool):
     """
     Clean Tarang state from the project.
 
-    Removes the .tarang directory and all saved state.
+    Removes the .tarang directory and backup files.
     """
     project_path = Path(project_dir).resolve()
     tarang_dir = project_path / ".tarang"
+    backup_dir = project_path / ".tarang_backups"
 
-    if not tarang_dir.exists():
+    if not tarang_dir.exists() and not backup_dir.exists():
         click.echo("No Tarang state to clean.")
         return
 
     if not force:
         click.confirm(
-            f"This will remove all Tarang state from {project_path}. Continue?",
+            f"Remove Tarang state from {project_path}?",
             abort=True,
         )
 
-    import shutil
-    shutil.rmtree(tarang_dir)
-    click.echo("Tarang state cleaned.")
+    if tarang_dir.exists():
+        shutil.rmtree(tarang_dir)
+        click.echo("Removed .tarang directory")
+
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+        click.echo("Removed .tarang_backups directory")
+
+    click.echo("Done.")
 
 
 @cli.command()
-@click.option(
-    "--project-dir", "-p",
-    default=".",
-    help="Project directory to operate in",
-)
-@click.option(
-    "--config", "-c",
-    default="explorer",
-    help="Agent config to use",
-)
-@click.option(
-    "--verbose", "-v",
-    is_flag=True,
-    help="Enable verbose output",
-)
-def chat(project_dir: str, config: str, verbose: bool):
+def logout():
     """
-    Start an interactive chat session with Tarang.
-
-    Allows follow-up questions and multi-turn conversations.
-
-    Example:
-        tarang chat
-        > explain the project structure
-        > can we add a logo?
-        > exit
+    Log out and clear saved credentials.
     """
-    from tarang.orchestrator import execute_instruction, check_framework
-    from tarang.memory.project_memory import ProjectMemory
+    auth = TarangAuth()
 
-    # Check framework
-    status = check_framework()
-    if not status.get("available") or not status.get("configured"):
-        click.echo(f"Error: {status.get('error')}", err=True)
-        sys.exit(1)
+    if not auth.is_authenticated():
+        click.echo("Not logged in.")
+        return
 
-    project_path = Path(project_dir).resolve()
-    if not project_path.exists():
-        click.echo(f"Error: Project directory not found: {project_dir}", err=True)
-        sys.exit(1)
-
-    click.echo(f"\n{'='*60}")
-    click.echo(f"Tarang v{__version__} - Interactive Mode")
-    click.echo(f"Project: {project_path}")
-    click.echo(f"{'='*60}")
-    click.echo("\nType your instructions. Commands:")
-    click.echo("  exit, quit, q  - Exit chat")
-    click.echo("  clear          - Clear conversation history")
-    click.echo("  status         - Show project status")
-    click.echo(f"{'─'*60}\n")
-
-    # Track conversation history for context
-    conversation_history = []
-    memory = ProjectMemory(str(project_path))
-
-    while True:
-        try:
-            # Get user input
-            user_input = click.prompt("You", prompt_suffix=" > ", default="", show_default=False)
-
-            if not user_input.strip():
-                continue
-
-            # Handle special commands
-            cmd = user_input.strip().lower()
-            if cmd in ("exit", "quit", "q"):
-                click.echo("\nGoodbye!")
-                break
-            elif cmd == "clear":
-                conversation_history = []
-                click.echo("Conversation history cleared.\n")
-                continue
-            elif cmd == "status":
-                state = memory.load_state()
-                if state:
-                    click.echo(f"Last instruction: {state.get('instruction', 'N/A')[:50]}...")
-                    click.echo(f"Status: {state.get('status', 'unknown')}")
-                else:
-                    click.echo("No previous state found.")
-                click.echo()
-                continue
-
-            # Build context from conversation history
-            context_prefix = ""
-            if conversation_history:
-                context_prefix = "Previous conversation:\n"
-                for turn in conversation_history[-3:]:  # Keep last 3 turns for context
-                    context_prefix += f"User: {turn['user']}\n"
-                    context_prefix += f"Assistant: {turn['assistant'][:200]}...\n\n"
-                context_prefix += "Current request:\n"
-
-            full_instruction = context_prefix + user_input
-
-            # Run the instruction
-            click.echo()  # Blank line before output
-            result = asyncio.run(execute_instruction(
-                instruction=full_instruction,
-                project_dir=str(project_path),
-                config_name=config,
-                verbose=verbose,
-                save_state=True,
-            ))
-
-            if "error" in result:
-                click.echo(f"Error: {result['error']}\n", err=True)
-                continue
-
-            # Extract and display result - check multiple possible locations
-            agent_result = result.get("result", {})
-            response_text = ""
-            if isinstance(agent_result, dict):
-                summary = (
-                    agent_result.get("human_readable_summary") or
-                    agent_result.get("final_answer") or
-                    agent_result.get("response") or
-                    agent_result.get("summary") or
-                    agent_result.get("message")
-                )
-                if not summary:
-                    payload = agent_result.get("payload", {})
-                    if isinstance(payload, dict):
-                        summary = (
-                            payload.get("message") or
-                            payload.get("response") or
-                            payload.get("final_answer")
-                        )
-                if summary:
-                    response_text = summary
-                    click.echo(f"\n{'─'*60}")
-                    click.echo(summary)
-                    click.echo(f"{'─'*60}\n")
-            elif isinstance(agent_result, str) and agent_result:
-                response_text = agent_result
-                click.echo(f"\n{'─'*60}")
-                click.echo(agent_result)
-                click.echo(f"{'─'*60}\n")
-
-            # Save to conversation history
-            conversation_history.append({
-                "user": user_input,
-                "assistant": response_text or "Task completed"
-            })
-
-        except KeyboardInterrupt:
-            click.echo("\n\nInterrupted. Type 'exit' to quit or continue chatting.\n")
-            continue
-        except EOFError:
-            click.echo("\nGoodbye!")
-            break
-        except Exception as e:
-            click.echo(f"Error: {e}\n", err=True)
-            continue
-
-
-@cli.command()
-def check():
-    """
-    Check if Tarang is properly configured.
-
-    Verifies that all dependencies are installed and environment is set up.
-    """
-    click.echo(f"\n{'='*60}")
-    click.echo(f"Tarang Configuration Check")
-    click.echo(f"{'='*60}\n")
-
-    # Check version
-    click.echo(f"Tarang version: {__version__}")
-
-    # Check framework
-    status = check_framework()
-
-    if status.get("available"):
-        click.echo("agent_framework: installed")
-    else:
-        click.echo("agent_framework: NOT INSTALLED")
-        click.echo("  Install with: pip install agent-framework")
-
-    if status.get("configured"):
-        click.echo("OPENROUTER_API_KEY: configured")
-    else:
-        click.echo("OPENROUTER_API_KEY: NOT SET")
-        click.echo("  Set with: export OPENROUTER_API_KEY=your_key")
-
-    # Check config files
-    from tarang.orchestrator import CONFIGS_DIR
-    configs = [
-        "orchestrator.yaml",
-        "architect.yaml",
-        "explorer.yaml",
-        "coder.yaml",
-        "planner.yaml",
-        "worker_pool.yaml",
-        "file_worker.yaml",
-        "shell_worker.yaml",
-    ]
-
-    click.echo(f"\nConfig directory: {CONFIGS_DIR}")
-    all_configs_present = True
-    for config in configs:
-        config_path = CONFIGS_DIR / config
-        if config_path.exists():
-            click.echo(f"  {config}: present")
-        else:
-            click.echo(f"  {config}: MISSING")
-            all_configs_present = False
-
-    # Summary
-    click.echo(f"\n{'='*60}")
-    if status.get("available") and status.get("configured") and all_configs_present:
-        click.echo("All checks passed! Tarang is ready to use.")
-    else:
-        click.echo("Some checks failed. Please fix the issues above.")
-    click.echo(f"{'='*60}\n")
+    if click.confirm("Clear all saved credentials?"):
+        auth.clear_credentials()
+        click.echo("Logged out. Credentials cleared.")
 
 
 def main():

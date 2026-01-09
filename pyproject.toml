@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tarang"
 version = "2.0.0"
-description = "Tarang - AI Coding Agent with ManagerAgent Architecture"
+description = "Tarang - AI Coding Agent (Thin Client)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -25,11 +25,12 @@ classifiers = [
     "Topic :: Software Development :: Code Generators",
 ]
 
+# Minimal dependencies - no agent framework needed
 dependencies = [
-    "auto-ai-agent-framework>=0.3.0",
     "click>=8.0.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
-    "pyyaml>=6.0.0",
     "rich>=13.0.0",
 ]
 
@@ -42,7 +43,7 @@ dev = [
 ]
 
 [project.scripts]
-tarang = "tarang.cli:cli"
+tarang = "tarang.cli:main"
 
 [project.urls]
 Homepage = "https://devtarang.ai"
@@ -51,9 +52,6 @@ Repository = "https://github.com/tarang-ai/tarang-cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-tarang = ["*.yaml", "**/*.yaml"]
 
 [tool.ruff]
 target-version = "py310"

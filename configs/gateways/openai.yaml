@@ -1,2 +1,0 @@
-name: OpenAIGateway
-class: agent_framework.gateways.inference.OpenAIGateway

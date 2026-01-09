@@ -1,2 +1,0 @@
-name: ConsoleSubscriber
-class: tarang.observability.subscribers.ConsoleSubscriber

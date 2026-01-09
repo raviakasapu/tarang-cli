@@ -1,2 +1,0 @@
-name: DefaultTerminationPolicy
-class: agent_framework.policies.DefaultTerminationPolicy

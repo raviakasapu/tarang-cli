@@ -1,2 +1,0 @@
-name: SharedInMemoryMemory
-class: agent_framework.components.memory.SharedInMemoryMemory
