@@ -67,7 +67,7 @@ class TarangAPIClient:
     Handles authentication, requests, and streaming responses.
     """
 
-    DEFAULT_BASE_URL = "https://api.devtarang.ai"
+    DEFAULT_BASE_URL = "https://tarang-backend-intl-web-app-production.up.railway.app"
 
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = base_url or self.DEFAULT_BASE_URL
