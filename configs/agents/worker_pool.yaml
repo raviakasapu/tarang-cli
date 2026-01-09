@@ -1,0 +1,91 @@
+apiVersion: agent.framework/v2
+kind: ManagerAgent
+
+metadata:
+  name: WorkerPool
+  description: Executes task lists by delegating to file and shell workers
+
+resources:
+  inference_gateways:
+    - name: worker-pool-gateway
+      type: OpenAIGateway
+      config:
+        model: ${MANAGER_MODEL:-deepseek/deepseek-chat-v3-0324}
+        api_key: ${OPENROUTER_API_KEY}
+        base_url: https://openrouter.ai/api
+
+  workers:
+    - name: file_worker
+      config_path: configs/agents/file_worker.yaml
+    - name: shell_worker
+      config_path: configs/agents/shell_worker.yaml
+
+spec:
+  policies:
+    termination:
+      type: DefaultTerminationPolicy
+      config:
+        max_iterations: 100
+        require_terminal_tool: true
+        terminal_tools: [complete_task]
+
+    follow_up:
+      type: DefaultFollowUpPolicy
+      config:
+        enabled: true
+        max_phases: 20  # May need many phases for large projects
+
+    completion:
+      type: DefaultCompletionDetector
+      config:
+        indicators: []  # Empty - only complete_task terminates
+
+  planner:
+    type: StrategicPlanner
+    config:
+      inference_gateway: worker-pool-gateway
+      system_prompt: |
+        You are a Worker Pool Manager. You execute task lists by delegating to workers.
+
+        ## Your Workflow
+        1. Receive a task list from the planner
+        2. For each task, delegate to the appropriate worker:
+           - "file" tasks -> file_worker
+           - "shell" tasks -> shell_worker
+        3. Track completed tasks
+        4. Only call complete_task when ALL tasks are done
+
+        ## Strategic Plan Format
+        Process tasks in dependency order:
+        {
+          "phases": [
+            {"worker": "file_worker", "task": "Create file: path/to/file.py with content for: description"},
+            {"worker": "file_worker", "task": "Modify file: path/to/other.py to: change description"},
+            {"worker": "shell_worker", "task": "Run: npm install package"}
+          ]
+        }
+
+        ## Delegation Format
+        For file_worker:
+        - "Create file: <path> with: <description of what to write>"
+        - "Modify file: <path> by: <description of changes>"
+
+        For shell_worker:
+        - "Run command: <command> in directory: <path>"
+
+        ## Rules
+        - Execute tasks in dependency order
+        - Wait for each task to complete before starting dependents
+        - If a task fails, report the error but continue with non-dependent tasks
+        - Track all completed and failed tasks
+        - Only call complete_task when all tasks are processed
+
+        ## complete_task Format
+        {
+          "tasks_completed": ["task 1", "task 2"],
+          "tasks_failed": [],
+          "files_created": ["path1", "path2"],
+          "files_modified": ["path3"],
+          "commands_run": ["cmd1", "cmd2"],
+          "summary": "Execution summary"
+        }

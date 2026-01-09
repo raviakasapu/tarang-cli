@@ -1,24 +1,23 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarang"
-version = "0.1.0"
-description = "AI-powered coding assistant - Privacy-first, high-accuracy code generation"
+version = "2.0.0"
+description = "Tarang - AI Coding Agent with ManagerAgent Architecture"
 readme = "README.md"
-license = "MIT"
 requires-python = ">=3.10"
+license = {text = "MIT"}
 authors = [
-    { name = "Tarang Team", email = "hello@devtarang.ai" }
+    {name = "Tarang Team", email = "hello@devtarang.ai"}
 ]
 keywords = ["ai", "coding", "assistant", "llm", "developer-tools"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -27,52 +26,43 @@ classifiers = [
 ]
 
 dependencies = [
-    "click>=8.1.0",
-    "rich>=13.0.0",
-    "httpx>=0.25.0",
-    "pydantic>=2.0.0",
+    "auto-ai-agent-framework>=0.3.0",
+    "click>=8.0.0",
     "python-dotenv>=1.0.0",
-    "aiofiles>=23.0.0",
-    "watchfiles>=0.21.0",
+    "pyyaml>=6.0.0",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "pytest-cov>=4.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
 ]
-ast = [
-    "tree-sitter>=0.20.0",
-    "tree-sitter-python>=0.20.0",
-    "tree-sitter-javascript>=0.20.0",
-    "tree-sitter-typescript>=0.20.0",
-]
 
 [project.scripts]
-tarang = "tarang.cli:main"
+tarang = "tarang.cli:cli"
 
 [project.urls]
 Homepage = "https://devtarang.ai"
 Documentation = "https://docs.devtarang.ai"
 Repository = "https://github.com/tarang-ai/tarang-cli"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/tarang"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tarang = ["*.yaml", "**/*.yaml"]
 
 [tool.ruff]
 target-version = "py310"
 line-length = 100
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
-ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
-warn_return_any = true
-warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

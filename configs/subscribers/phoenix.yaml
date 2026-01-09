@@ -1,0 +1,2 @@
+name: PhoenixSubscriber
+class: agent_framework.observability.subscribers.PhoenixSubscriber

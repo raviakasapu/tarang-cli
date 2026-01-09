@@ -1,6 +1,6 @@
 # Tarang CLI
 
-AI-powered coding assistant - Privacy-first, high-accuracy code generation.
+AI-powered coding assistant with ManagerAgent architecture.
 
 ## Installation
 
@@ -10,53 +10,54 @@ pip install tarang
 
 ## Quick Start
 
-1. **Initialize your project:**
-   ```bash
-   tarang init
-   ```
+```bash
+# Start interactive session
+tarang run
 
-2. **Start a session:**
-   ```bash
-   tarang
-   ```
+# Run a single instruction
+tarang run "create a hello world app"
 
-3. **Enter your coding request:**
-   ```
-   > Add a dark mode toggle to the settings page
-   ```
+# Run and exit
+tarang run "fix linter errors" --once
+```
 
 ## Commands
 
-- `tarang` - Start an interactive coding session
-- `tarang init` - Initialize Tarang for the current project
-- `tarang login` - Authenticate with devtarang.ai
-- `tarang status` - Show current configuration status
-- `tarang ask "question"` - Ask a quick question
+- `tarang run [instruction]` - Start coding session (interactive or single)
+- `tarang init <project>` - Initialize a new project
+- `tarang chat` - Interactive chat mode
+- `tarang status` - Show project status
+- `tarang resume` - Resume interrupted execution
+- `tarang reset` - Reset execution state
+- `tarang clean` - Remove all Tarang state
+- `tarang check` - Verify configuration
 
 ## Options
 
-- `--no-lint` - Skip shadow linting verification
-- `--dry-run` - Show changes without applying them
-- `--verbose` - Enable verbose output
+- `--project-dir, -p` - Project directory (default: current)
+- `--config, -c` - Agent config (coder, explorer, orchestrator)
+- `--verbose, -v` - Enable verbose output
+- `--once` - Run single instruction and exit
 
 ## Configuration
 
-Tarang uses two configuration files:
+Tarang requires an OpenRouter API key:
 
-- **Global config:** `~/.tarang/config.json` - API keys and preferences
-- **Project config:** `.tarang/project.json` - Project-specific settings
+```bash
+export OPENROUTER_API_KEY=your_key
+```
 
-## BYOK (Bring Your Own Key)
+## Project State
 
-Tarang uses OpenRouter for LLM access. Get your API key at [openrouter.ai/keys](https://openrouter.ai/keys).
-
-## Privacy
-
-- Your code never leaves your machine for storage
-- Only necessary context is sent for processing
-- All processing happens in-memory
+Tarang stores execution state in `.tarang/` directory:
+- `state.json` - Current execution state
+- Supports resume after interruption
 
 ## Links
 
 - Website: [devtarang.ai](https://devtarang.ai)
 - Documentation: [docs.devtarang.ai](https://docs.devtarang.ai)
+
+## License
+
+MIT

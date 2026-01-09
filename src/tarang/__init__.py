@@ -1,4 +1,7 @@
-"""Tarang - AI-powered coding assistant."""
+"""
+Tarang v2 - AI Coding Agent with ManagerAgent Architecture
 
-__version__ = "0.1.0"
-__author__ = "Tarang Team"
+A hierarchical agent system for autonomous code generation and project management.
+"""
+
+__version__ = "2.0.0"

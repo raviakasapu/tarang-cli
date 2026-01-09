@@ -1,0 +1,2 @@
+name: WorkerEditFileTool
+class: tarang.tools.file_tools.EditFileTool
