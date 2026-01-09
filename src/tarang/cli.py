@@ -21,6 +21,37 @@ import click
 
 from tarang import __version__
 from tarang.client import TarangAPIClient, TarangAuth, TarangResponse
+
+# ASCII Art Banner
+DEV_BANNER = [
+    "                         ██████╗          ███████╗         ██╗   ██╗",
+    "                         ██╔══██╗         ██╔════╝         ██║   ██║",
+    "                         ██║  ██║         █████╗           ██║   ██║",
+    "                         ██║  ██║         ██╔══╝           ╚██╗ ██╔╝",
+    "                         ██████╔╝         ███████╗          ╚████╔╝ ",
+    "                         ╚═════╝          ╚══════╝           ╚═══╝  ",
+]
+
+TARANG_BANNER = [
+    "████████╗         █████╗         ██████╗          █████╗         ███╗   ██╗        ██████╗ ",
+    "╚══██╔══╝        ██╔══██╗        ██╔══██╗        ██╔══██╗        ████╗  ██║       ██╔════╝ ",
+    "   ██║           ███████║        ██████╔╝        ███████║        ██╔██╗ ██║       ██║  ███╗",
+    "   ██║           ██╔══██║        ██╔══██╗        ██╔══██║        ██║╚██╗██║       ██║   ██║",
+    "   ██║           ██║  ██║        ██║  ██║        ██║  ██║        ██║ ╚████║       ╚██████╔╝",
+    "   ╚═╝           ╚═╝  ╚═╝        ╚═╝  ╚═╝        ╚═╝  ╚═╝        ╚═╝  ╚═══╝        ╚═════╝ ",
+]
+
+
+def print_banner():
+    """Print the Tarang ASCII art banner."""
+    click.echo()
+    for line in DEV_BANNER:
+        click.echo(click.style(line, fg="green", bold=True))
+    click.echo()
+    for line in TARANG_BANNER:
+        click.echo(click.style(line, fg="cyan", bold=True))
+
+
 from tarang.client.api_client import LocalContext
 from tarang.context import SkeletonGenerator
 from tarang.executor import DiffApplicator, ShadowLinter
@@ -203,11 +234,10 @@ def run(
     client.token = creds.get("token")
     client.openrouter_key = creds.get("openrouter_key")
 
-    # Generate project skeleton
-    click.echo(f"\n{'='*60}")
-    click.echo(f"Tarang v{__version__}")
-    click.echo(f"Project: {project_path}")
-    click.echo(f"{'='*60}")
+    # Show banner
+    print_banner()
+    click.echo()
+    click.echo(f"v{__version__} | Project: {project_path}")
 
     if verbose:
         click.echo("\nScanning project...")
@@ -512,9 +542,10 @@ def status():
     auth = TarangAuth()
     creds = auth.load_credentials() or {}
 
-    click.echo(f"\n{'='*60}")
-    click.echo(f"Tarang v{__version__} Status")
-    click.echo(f"{'='*60}\n")
+    print_banner()
+    click.echo()
+    click.echo(f"v{__version__} Status")
+    click.echo(f"{'='*40}\n")
 
     # Auth status
     if auth.is_authenticated():
