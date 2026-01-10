@@ -156,7 +156,10 @@ class _CallbackServer:
                 self.wfile.write(html.encode())
 
                 if parent.token:
+                    print("\nReceived CLI callback, completing login...")
                     parent._received.set()
+                else:
+                    print("\nReceived CLI callback without token. Please retry login.")
 
             def log_message(self, *args):
                 pass  # Suppress HTTP logs
