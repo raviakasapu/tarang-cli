@@ -218,12 +218,25 @@ def run(
     session_id = None
     conversation_history: List[Dict[str, str]] = []
     pending_changes: List[Dict[str, Any]] = []
+    project_name = project_path.name
 
     async def run_instruction(instr: str) -> str:
         """Run a single instruction and return response."""
         nonlocal session_id, context, pending_changes
 
         context.history = conversation_history[-6:]
+
+        # Create session in Supabase for tracking (if not already exists)
+        if session_id is None:
+            created_session = await client.create_session(
+                instruction=instr,
+                project_name=project_name,
+                project_path=str(project_path),
+            )
+            if created_session:
+                session_id = created_session.get("id")
+                if verbose:
+                    ui.print_info(f"Session: {session_id}")
 
         # Collect relevant file contents for the backend to reason about
         with ui.thinking("Collecting context..."):
@@ -248,25 +261,56 @@ def run(
         # Handle response types
         if response.type == "error":
             ui.print_error(response.error or "Unknown error")
+            # Update session as failed
+            if session_id:
+                await client.update_session(
+                    session_id=session_id,
+                    status="failed",
+                    error_message=response.error,
+                )
             return ""
 
         if verbose and response.thought_process:
             ui.print_thought(response.thought_process)
 
+        # Track token usage if available
+        if session_id and response.tokens_used > 0:
+            await client.update_session_usage(
+                session_id=session_id,
+                input_tokens=0,  # Backend doesn't split tokens yet
+                output_tokens=response.tokens_used,
+            )
+
         # Handle edits
         if response.type == "edits" and response.edits:
-            return await _handle_edits(
+            result = await _handle_edits(
                 response, ui, diff_applicator, diff_viewer, linter,
                 client, project_path, no_lint, dry_run, auto_commit
             )
+            # Update session with applied files
+            if session_id:
+                applied_files = [e.file for e in response.edits]
+                await client.update_session(
+                    session_id=session_id,
+                    status="done",
+                    applied_files=applied_files,
+                )
+            return result
 
         # Handle commands
         if response.type == "command" and response.commands:
-            return await _run_commands(response, project_path, ui)
+            result = await _run_commands(response, project_path, ui)
+            # Update session as done
+            if session_id:
+                await client.update_session(session_id=session_id, status="done")
+            return result
 
         # Handle message
         if response.message:
             ui.print_message(response.message)
+            # Update session as done for message responses
+            if session_id:
+                await client.update_session(session_id=session_id, status="done")
             return response.message
 
         return ""

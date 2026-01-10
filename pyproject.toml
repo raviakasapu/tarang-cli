@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarang"
-version = "3.0.0"
+version = "3.1.0"
 description = "Tarang - AI Coding Agent (Thin Client with Local Execution)"
 readme = "README.md"
 requires-python = ">=3.10"
