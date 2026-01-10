@@ -23,7 +23,7 @@ import click
 
 from tarang import __version__
 from tarang.client import TarangAPIClient, TarangAuth, TarangResponse
-from tarang.client.api_client import LocalContext
+from tarang.client.api_client import LocalContext, collect_relevant_files
 from tarang.context import SkeletonGenerator
 from tarang.executor import DiffApplicator, ShadowLinter
 from tarang.ui import TarangConsole, DiffViewer
@@ -225,6 +225,17 @@ def run(
 
         context.history = conversation_history[-6:]
 
+        # Collect relevant file contents for the backend to reason about
+        with ui.thinking("Collecting context..."):
+            file_contents = collect_relevant_files(
+                project_path=project_path,
+                instruction=instr,
+                skeleton=context.skeleton,
+                max_files=10,
+                max_size=50000,
+            )
+            context.file_contents = file_contents
+
         with ui.thinking():
             response = await client.execute(
                 instruction=instr,
@@ -363,12 +374,13 @@ async def _handle_edits(
     auto_commit: bool,
 ) -> str:
     """Handle edits from backend response with preview."""
+    # Build preview data using helper methods for search/replace
     edits = [
         {
             "file": e.file,
             "content": e.content,
-            "search": e.search,
-            "replace": e.replace,
+            "search": e.get_search(),  # Use helper method
+            "replace": e.get_replace(),  # Use helper method
             "diff": e.diff,
             "description": e.description,
         }
@@ -387,10 +399,13 @@ async def _handle_edits(
     # Apply edits
     results = []
     for edit in response.edits:
+        search_text = edit.get_search()
+        replace_text = edit.get_replace()
+
         if edit.content:
             result = diff_applicator.apply_content(edit.file, edit.content)
-        elif edit.search and edit.replace:
-            result = diff_applicator.apply_search_replace(edit.file, edit.search, edit.replace)
+        elif search_text and replace_text:
+            result = diff_applicator.apply_search_replace(edit.file, search_text, replace_text)
         elif edit.diff:
             result = diff_applicator.apply_diff(edit.file, edit.diff)
         else:
@@ -434,28 +449,48 @@ async def _run_commands(response: TarangResponse, project_path: Path, ui: Tarang
     """Run shell commands from backend response."""
     ui.console.print()
 
+    commands_run = 0
+    commands_skipped = 0
+
     for cmd in response.commands:
+        # Show description
         if cmd.description:
             ui.print_info(cmd.description)
+
+        # Ask for confirmation if required
+        if cmd.require_confirmation:
+            ui.console.print(f"[yellow]Command:[/] {cmd.command}")
+            if not ui.confirm("Run this command?", default=True):
+                ui.print_info("Skipped")
+                commands_skipped += 1
+                continue
+
+        # Determine working directory
+        cwd = project_path
+        if cmd.working_dir:
+            cwd = project_path / cmd.working_dir
 
         try:
             result = subprocess.run(
                 cmd.command,
                 shell=True,
-                cwd=project_path,
+                cwd=cwd,
                 capture_output=True,
                 timeout=cmd.timeout,
             )
 
             output = result.stdout.decode() + result.stderr.decode()
             ui.print_command_output(cmd.command, output, result.returncode)
+            commands_run += 1
 
         except subprocess.TimeoutExpired:
-            ui.print_warning(f"Command timed out: {cmd.command}")
+            ui.print_warning(f"Command timed out after {cmd.timeout}s: {cmd.command}")
         except Exception as e:
             ui.print_error(f"Command failed: {e}")
 
-    return f"Ran {len(response.commands)} command(s)"
+    if commands_skipped > 0:
+        return f"Ran {commands_run} command(s), skipped {commands_skipped}"
+    return f"Ran {commands_run} command(s)"
 
 
 @cli.command()

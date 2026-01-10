@@ -2,52 +2,103 @@
 Tarang API Client - HTTP client for the Orchestrator backend.
 
 Handles communication with the hosted Tarang backend service.
+Implements the thin-client architecture where:
+- CLI: Sends context, executes returned instructions locally
+- Backend: Reasoning/planning, returns instructions
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 from pydantic import BaseModel
 
 
+class SearchReplace(BaseModel):
+    """Search and replace instruction."""
+    search: str
+    replace: str
+
+
 class EditInstruction(BaseModel):
-    """Edit instruction from backend."""
+    """Edit instruction from backend.
+
+    Supports three modes:
+    - content: Full file write (create/overwrite)
+    - search_replace: Find and replace text
+    - diff: Apply unified diff patch
+    """
     file: str
     diff: Optional[str] = None
     content: Optional[str] = None
+    search_replace: Optional[SearchReplace] = None
+    # Legacy fields for backwards compatibility
     search: Optional[str] = None
     replace: Optional[str] = None
     description: str = ""
 
+    def get_search(self) -> Optional[str]:
+        """Get search text from either format."""
+        if self.search_replace:
+            return self.search_replace.search
+        return self.search
 
-class ShellCommand(BaseModel):
-    """Shell command from backend."""
+    def get_replace(self) -> Optional[str]:
+        """Get replace text from either format."""
+        if self.search_replace:
+            return self.search_replace.replace
+        return self.replace
+
+
+class CommandInstruction(BaseModel):
+    """Shell command instruction from backend."""
     command: str
-    working_dir: str = "."
-    timeout: int = 30
+    working_dir: Optional[str] = None
     description: str = ""
+    require_confirmation: bool = False
+    timeout: int = 60
+
+
+# Alias for backwards compatibility
+ShellCommand = CommandInstruction
 
 
 class TarangResponse(BaseModel):
-    """Response from Tarang backend."""
+    """Response from Tarang backend.
+
+    Response types:
+    - message: Text response, no execution needed
+    - edits: File edit instructions for CLI to execute
+    - command: Shell command instructions for CLI to execute
+    - error: Error occurred during processing
+    """
     session_id: str
-    type: str = "message"  # message, edits, command, error, done
+    type: str = "message"  # message, edits, command, error
     message: str = ""
     edits: List[EditInstruction] = []
-    commands: List[ShellCommand] = []
+    commands: List[CommandInstruction] = []
+    command: Optional[str] = None  # Legacy single command field
     thought_process: Optional[str] = None
     error: Optional[str] = None
     recoverable: bool = True
 
+    # Metadata
+    model_used: Optional[str] = None
+    tokens_used: int = 0
+
 
 @dataclass
 class LocalContext:
-    """Local context to send to backend."""
+    """Local context to send to backend.
+
+    Contains project information for the backend to reason about.
+    """
     project_root: str
     skeleton: Dict[str, Any] = field(default_factory=dict)
+    file_contents: Dict[str, str] = field(default_factory=dict)
     active_files: List[Dict[str, str]] = field(default_factory=list)
     git_status: Optional[str] = None
     history: List[Dict[str, str]] = field(default_factory=list)
@@ -56,8 +107,13 @@ class LocalContext:
         return {
             "cwd": self.project_root,
             "skeleton": self.skeleton,
+            "file_contents": self.file_contents,
             "history": self.history,
         }
+
+    def add_file(self, file_path: str, content: str) -> None:
+        """Add a file's content to the context."""
+        self.file_contents[file_path] = content
 
 
 class TarangAPIClient:
@@ -78,7 +134,7 @@ class TarangAPIClient:
         """Build request headers."""
         headers = {
             "Content-Type": "application/json",
-            "X-Tarang-Protocol-Version": "2.0",
+            "X-Tarang-Protocol-Version": "3.0",  # Updated protocol version
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -99,7 +155,7 @@ class TarangAPIClient:
 
         Args:
             instruction: User's instruction/request
-            context: Local project context
+            context: Local project context (skeleton, file_contents)
             session_id: Optional session ID for continuity
             file_content: Optional focused file content
             file_path: Optional file path being edited
@@ -133,10 +189,16 @@ class TarangAPIClient:
                     recoverable=False,
                 )
             except httpx.HTTPStatusError as e:
+                error_detail = ""
+                try:
+                    error_data = e.response.json()
+                    error_detail = error_data.get("detail", "")
+                except Exception:
+                    pass
                 return TarangResponse(
                     session_id=session_id or "",
                     type="error",
-                    error=f"Server error: {e.response.status_code}",
+                    error=f"Server error: {e.response.status_code}. {error_detail}",
                     recoverable=True,
                 )
             except Exception as e:
@@ -390,3 +452,80 @@ class TarangAPIClient:
                 return True
         except Exception:
             return False
+
+
+def collect_relevant_files(
+    project_path: Path,
+    instruction: str,
+    skeleton: Dict[str, Any],
+    max_files: int = 10,
+    max_size: int = 50000,
+) -> Dict[str, str]:
+    """
+    Collect relevant file contents based on instruction.
+
+    This helps the backend have context for reasoning.
+
+    Args:
+        project_path: Project root path
+        instruction: User instruction (used to find relevant files)
+        skeleton: Project skeleton
+        max_files: Maximum number of files to include
+        max_size: Maximum total size in characters
+
+    Returns:
+        Dict of file_path -> content
+    """
+    file_contents = {}
+    total_size = 0
+
+    # Extract file paths mentioned in instruction
+    mentioned_files = []
+    instruction_lower = instruction.lower()
+
+    def find_files_in_skeleton(node: Dict[str, Any], prefix: str = "") -> List[str]:
+        """Recursively find all files in skeleton."""
+        files = []
+        for name, value in node.items():
+            path = f"{prefix}/{name}".lstrip("/") if prefix else name
+            if isinstance(value, dict):
+                files.extend(find_files_in_skeleton(value, path))
+            else:
+                files.append(path)
+        return files
+
+    all_files = find_files_in_skeleton(skeleton)
+
+    # Find files mentioned in instruction
+    for file_path in all_files:
+        file_name = Path(file_path).name.lower()
+        if file_name in instruction_lower or file_path.lower() in instruction_lower:
+            mentioned_files.append(file_path)
+
+    # Also include key files
+    key_files = [
+        "package.json", "pyproject.toml", "requirements.txt",
+        "tsconfig.json", "vite.config.ts", "next.config.js",
+        "README.md", "src/App.tsx", "src/main.tsx", "src/index.ts",
+        "app.py", "main.py", "__init__.py",
+    ]
+
+    for key_file in key_files:
+        for file_path in all_files:
+            if file_path.endswith(key_file):
+                if file_path not in mentioned_files:
+                    mentioned_files.append(file_path)
+
+    # Read file contents
+    for file_path in mentioned_files[:max_files]:
+        full_path = project_path / file_path
+        if full_path.exists() and full_path.is_file():
+            try:
+                content = full_path.read_text(encoding="utf-8", errors="replace")
+                if len(content) + total_size <= max_size:
+                    file_contents[file_path] = content
+                    total_size += len(content)
+            except Exception:
+                pass
+
+    return file_contents
