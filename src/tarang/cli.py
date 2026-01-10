@@ -1,60 +1,44 @@
 """
-Tarang CLI - Thin client for the AI coding agent.
+Tarang CLI - AI coding assistant with rich terminal UI.
 
-The CLI handles local operations (files, shell) while the backend
+The CLI handles local operations (files, shell, git) while the backend
 handles all reasoning and orchestration.
 
 Usage:
     tarang login                      # Authenticate with GitHub
     tarang config --openrouter-key    # Set API key
     tarang run "create a hello world" # Run instruction
-    tarang                             # Interactive mode
+    tarang                            # Interactive mode
 """
 from __future__ import annotations
 
 import asyncio
 import shutil
+import subprocess
 import sys
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 import click
 
 from tarang import __version__
 from tarang.client import TarangAPIClient, TarangAuth, TarangResponse
-
-# ASCII Art Banner
-DEV_BANNER = [
-    "                         ██████╗          ███████╗         ██╗   ██╗",
-    "                         ██╔══██╗         ██╔════╝         ██║   ██║",
-    "                         ██║  ██║         █████╗           ██║   ██║",
-    "                         ██║  ██║         ██╔══╝           ╚██╗ ██╔╝",
-    "                         ██████╔╝         ███████╗          ╚████╔╝ ",
-    "                         ╚═════╝          ╚══════╝           ╚═══╝  ",
-]
-
-TARANG_BANNER = [
-    "████████╗         █████╗         ██████╗          █████╗         ███╗   ██╗        ██████╗ ",
-    "╚══██╔══╝        ██╔══██╗        ██╔══██╗        ██╔══██╗        ████╗  ██║       ██╔════╝ ",
-    "   ██║           ███████║        ██████╔╝        ███████║        ██╔██╗ ██║       ██║  ███╗",
-    "   ██║           ██╔══██║        ██╔══██╗        ██╔══██║        ██║╚██╗██║       ██║   ██║",
-    "   ██║           ██║  ██║        ██║  ██║        ██║  ██║        ██║ ╚████║       ╚██████╔╝",
-    "   ╚═╝           ╚═╝  ╚═╝        ╚═╝  ╚═╝        ╚═╝  ╚═╝        ╚═╝  ╚═══╝        ╚═════╝ ",
-]
-
-
-def print_banner():
-    """Print the Tarang ASCII art banner."""
-    click.echo()
-    for line in DEV_BANNER:
-        click.echo(click.style(line, fg="green", bold=True))
-    click.echo()
-    for line in TARANG_BANNER:
-        click.echo(click.style(line, fg="cyan", bold=True))
-
-
 from tarang.client.api_client import LocalContext
 from tarang.context import SkeletonGenerator
 from tarang.executor import DiffApplicator, ShadowLinter
+from tarang.ui import TarangConsole, DiffViewer
+
+
+# Global console instance
+console: Optional[TarangConsole] = None
+
+
+def get_console(verbose: bool = False) -> TarangConsole:
+    """Get or create console instance."""
+    global console
+    if console is None:
+        console = TarangConsole(verbose=verbose)
+    return console
 
 
 @click.group(invoke_without_command=True)
@@ -71,7 +55,6 @@ def cli(ctx):
         tarang config --openrouter-key YOUR_KEY
         tarang run "explain the project"
     """
-    # If no subcommand, start interactive session
     if ctx.invoked_subcommand is None:
         ctx.invoke(run)
 
@@ -84,46 +67,37 @@ def login():
     Opens a browser window for OAuth authentication.
     Your token is stored securely in ~/.tarang/config.json
     """
+    ui = get_console()
     auth = TarangAuth()
 
     if auth.is_authenticated():
-        click.echo("Already logged in.")
-        if not click.confirm("Login again?"):
+        ui.print_info("Already logged in.")
+        if not ui.confirm("Login again?", default=False):
             return
 
-    click.echo("Starting authentication...")
+    ui.print_info("Starting authentication...")
 
     try:
         asyncio.run(auth.login())
-        click.echo("\nLogin successful!")
-        click.echo("Your credentials are saved in ~/.tarang/config.json")
+        ui.print_success("Login successful!")
+        ui.print_info("Credentials saved to ~/.tarang/config.json")
 
         if not auth.has_openrouter_key():
-            click.echo("\nNext step: Set your OpenRouter API key:")
-            click.echo("  tarang config --openrouter-key YOUR_KEY")
+            ui.console.print("\n[yellow]Next step:[/] Set your OpenRouter API key:")
+            ui.console.print("  [cyan]tarang config --openrouter-key YOUR_KEY[/]")
 
     except TimeoutError:
-        click.echo("\nAuthentication timed out. Please try again.", err=True)
+        ui.print_error("Authentication timed out. Please try again.", recoverable=False)
         sys.exit(1)
     except Exception as e:
-        click.echo(f"\nAuthentication failed: {e}", err=True)
+        ui.print_error(f"Authentication failed: {e}", recoverable=False)
         sys.exit(1)
 
 
 @cli.command()
-@click.option(
-    "--openrouter-key", "-k",
-    help="Set your OpenRouter API key",
-)
-@click.option(
-    "--backend-url", "-u",
-    help="Set custom backend URL (default: https://api.devtarang.ai)",
-)
-@click.option(
-    "--show",
-    is_flag=True,
-    help="Show current configuration",
-)
+@click.option("--openrouter-key", "-k", help="Set your OpenRouter API key")
+@click.option("--backend-url", "-u", help="Set custom backend URL")
+@click.option("--show", is_flag=True, help="Show current configuration")
 def config(openrouter_key: str, backend_url: str, show: bool):
     """
     Configure Tarang settings.
@@ -134,62 +108,47 @@ def config(openrouter_key: str, backend_url: str, show: bool):
     View current config:
         tarang config --show
     """
+    ui = get_console()
     auth = TarangAuth()
 
     if show:
         creds = auth.load_credentials() or {}
-        click.echo(f"\nTarang Configuration (~/.tarang/config.json)")
-        click.echo(f"{'='*50}")
-        click.echo(f"Token: {'configured' if creds.get('token') else 'not set'}")
-        click.echo(f"OpenRouter Key: {'configured' if creds.get('openrouter_key') else 'not set'}")
+        ui.console.print("\n[bold]Tarang Configuration[/] (~/.tarang/config.json)")
+        ui.console.print("─" * 50)
+
+        token_status = "[green]✓ configured[/]" if creds.get("token") else "[red]✗ not set[/]"
+        key_status = "[green]✓ configured[/]" if creds.get("openrouter_key") else "[red]✗ not set[/]"
+
+        ui.console.print(f"Token:         {token_status}")
+        ui.console.print(f"OpenRouter:    {key_status}")
         if creds.get("backend_url"):
-            click.echo(f"Backend URL: {creds.get('backend_url')}")
-        click.echo()
+            ui.console.print(f"Backend URL:   {creds.get('backend_url')}")
+        ui.console.print()
         return
 
     if openrouter_key:
         if not openrouter_key.startswith("sk-or-"):
-            click.echo("Warning: OpenRouter keys usually start with 'sk-or-'", err=True)
+            ui.print_warning("OpenRouter keys usually start with 'sk-or-'")
 
         auth.save_openrouter_key(openrouter_key)
-        click.echo("OpenRouter API key saved.")
+        ui.print_success("OpenRouter API key saved.")
 
     if backend_url:
         auth.save_credentials(backend_url=backend_url)
-        click.echo(f"Backend URL set to: {backend_url}")
+        ui.print_success(f"Backend URL set to: {backend_url}")
 
     if not openrouter_key and not backend_url:
-        click.echo("No configuration changes made.")
-        click.echo("Use --help to see available options.")
+        ui.print_info("No configuration changes made. Use --help to see options.")
 
 
 @cli.command()
 @click.argument("instruction", required=False)
-@click.option(
-    "--project-dir", "-p",
-    default=".",
-    help="Project directory (default: current directory)",
-)
-@click.option(
-    "--no-lint",
-    is_flag=True,
-    help="Skip shadow linting after applying changes",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Show changes without applying them",
-)
-@click.option(
-    "--verbose", "-v",
-    is_flag=True,
-    help="Enable verbose output",
-)
-@click.option(
-    "--once",
-    is_flag=True,
-    help="Run single instruction and exit (no interactive mode)",
-)
+@click.option("--project-dir", "-p", default=".", help="Project directory")
+@click.option("--no-lint", is_flag=True, help="Skip linting after changes")
+@click.option("--dry-run", is_flag=True, help="Preview changes without applying")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+@click.option("--once", is_flag=True, help="Run single instruction and exit")
+@click.option("--auto-commit", "-c", is_flag=True, help="Auto-commit after changes")
 def run(
     instruction: str,
     project_dir: str,
@@ -197,6 +156,7 @@ def run(
     dry_run: bool,
     verbose: bool,
     once: bool,
+    auto_commit: bool,
 ):
     """
     Run Tarang AI coding assistant.
@@ -206,46 +166,43 @@ def run(
 
     Examples:
         tarang run                              # Interactive mode
-        tarang run "explain the project"        # Run then continue chatting
+        tarang run "explain the project"        # Run then continue
         tarang run "fix linter errors" --once   # Run and exit
         tarang run "add login" --dry-run        # Preview changes
     """
-    # Check authentication
+    ui = get_console(verbose)
     auth = TarangAuth()
 
+    # Check authentication
     if not auth.is_authenticated():
-        click.echo("Not logged in. Run 'tarang login' first.", err=True)
+        ui.print_error("Not logged in. Run 'tarang login' first.", recoverable=False)
         sys.exit(1)
 
     if not auth.has_openrouter_key():
-        click.echo("OpenRouter key not set.", err=True)
-        click.echo("Run: tarang config --openrouter-key YOUR_KEY", err=True)
+        ui.print_error("OpenRouter key not set.", recoverable=False)
+        ui.console.print("Run: [cyan]tarang config --openrouter-key YOUR_KEY[/]")
         sys.exit(1)
 
     # Resolve project directory
     project_path = Path(project_dir).resolve()
     if not project_path.exists():
-        click.echo(f"Error: Project directory not found: {project_dir}", err=True)
+        ui.print_error(f"Project directory not found: {project_dir}", recoverable=False)
         sys.exit(1)
 
-    # Initialize components
+    # Initialize client
     creds = auth.load_credentials()
     client = TarangAPIClient(creds.get("backend_url"))
     client.token = creds.get("token")
     client.openrouter_key = creds.get("openrouter_key")
 
-    # Show banner
-    print_banner()
-    click.echo()
-    click.echo(f"v{__version__} | Project: {project_path}")
+    # Show banner and project info
+    ui.print_banner(__version__, project_path)
 
-    if verbose:
-        click.echo("\nScanning project...")
+    with ui.thinking("Scanning project..."):
+        skeleton_gen = SkeletonGenerator(project_path)
+        skeleton = skeleton_gen.generate()
 
-    skeleton_gen = SkeletonGenerator(project_path)
-    skeleton = skeleton_gen.generate()
-
-    click.echo(f"Files: {skeleton.total_files} | Lines: {skeleton.total_lines}\n")
+    ui.print_project_stats(skeleton.total_files, skeleton.total_lines)
 
     # Build context
     context = LocalContext(
@@ -253,200 +210,207 @@ def run(
         skeleton=skeleton.to_dict(),
     )
 
-    # Initialize executor
+    # Initialize components
     diff_applicator = DiffApplicator(project_path)
+    diff_viewer = DiffViewer(ui.console)
     linter = ShadowLinter(project_path)
 
     session_id = None
-    conversation_history = []
+    conversation_history: List[Dict[str, str]] = []
+    pending_changes: List[Dict[str, Any]] = []
 
     async def run_instruction(instr: str) -> str:
         """Run a single instruction and return response."""
-        nonlocal session_id, context
+        nonlocal session_id, context, pending_changes
 
-        # Add conversation history to context
-        context.history = conversation_history[-6:]  # Last 3 exchanges
+        context.history = conversation_history[-6:]
 
-        click.echo("Thinking...")
-
-        response = await client.execute(
-            instruction=instr,
-            context=context,
-            session_id=session_id,
-        )
+        with ui.thinking():
+            response = await client.execute(
+                instruction=instr,
+                context=context,
+                session_id=session_id,
+            )
 
         session_id = response.session_id
 
         # Handle response types
         if response.type == "error":
-            click.echo(f"\nError: {response.error}", err=True)
+            ui.print_error(response.error or "Unknown error")
             return ""
 
-        # Show thought process if verbose
         if verbose and response.thought_process:
-            click.echo(f"\n[Thinking] {response.thought_process[:200]}...")
+            ui.print_thought(response.thought_process)
 
         # Handle edits
         if response.type == "edits" and response.edits:
-            return await _apply_edits(
-                response,
-                diff_applicator,
-                linter,
-                client,
-                no_lint,
-                dry_run,
+            return await _handle_edits(
+                response, ui, diff_applicator, diff_viewer, linter,
+                client, project_path, no_lint, dry_run, auto_commit
             )
 
         # Handle commands
         if response.type == "command" and response.commands:
-            return await _run_commands(response, project_path)
+            return await _run_commands(response, project_path, ui)
 
         # Handle message
         if response.message:
-            click.echo(f"\n{'─'*60}")
-            click.echo(response.message)
-            click.echo(f"{'─'*60}\n")
+            ui.print_message(response.message)
             return response.message
 
         return ""
+
+    def handle_slash_command(cmd: str) -> bool:
+        """Handle slash commands. Returns True if command was handled."""
+        cmd = cmd.lower().strip()
+
+        if cmd in ("/help", "/h", "/?"):
+            ui.print_help()
+            return True
+
+        if cmd in ("/git", "/status"):
+            ui.print_git_status(project_path)
+            return True
+
+        if cmd in ("/commit", "/c"):
+            ui.git_commit(project_path)
+            return True
+
+        if cmd in ("/diff", "/d"):
+            ui.git_diff(project_path)
+            return True
+
+        if cmd == "/clear":
+            conversation_history.clear()
+            ui.print_success("Conversation history cleared")
+            return True
+
+        if cmd in ("/session", "/info"):
+            ui.print_session_info(session_id, len(conversation_history))
+            return True
+
+        if cmd in ("/exit", "/quit", "/q"):
+            ui.print_goodbye()
+            sys.exit(0)
+
+        return False
 
     try:
         # Run initial instruction if provided
         if instruction:
             response = asyncio.run(run_instruction(instruction))
-            conversation_history.append({
-                "role": "user",
-                "content": instruction,
-            })
-            conversation_history.append({
-                "role": "assistant",
-                "content": response or "Task completed",
-            })
+            conversation_history.append({"role": "user", "content": instruction})
+            conversation_history.append({"role": "assistant", "content": response or "Done"})
 
             if once:
-                click.echo("Done.")
+                ui.print_success("Task completed")
                 return
 
         # Interactive mode
         if not once:
-            click.echo("Type your instructions (or 'exit' to quit):\n")
+            ui.console.print("[dim]Type your instructions, or /help for commands[/dim]\n")
 
         while not once:
             try:
-                user_input = click.prompt(
-                    "You",
-                    prompt_suffix=" > ",
-                    default="",
-                    show_default=False,
-                )
+                user_input = ui.prompt_input()
 
                 if not user_input.strip():
                     continue
 
-                cmd = user_input.strip().lower()
-                if cmd in ("exit", "quit", "q"):
-                    click.echo("\nGoodbye!")
-                    break
-                elif cmd == "clear":
-                    conversation_history.clear()
-                    click.echo("History cleared.\n")
-                    continue
-                elif cmd == "status":
-                    click.echo(f"Session: {session_id or 'None'}")
-                    click.echo(f"History: {len(conversation_history)} messages\n")
-                    continue
+                # Handle slash commands
+                if user_input.startswith("/"):
+                    if handle_slash_command(user_input):
+                        continue
 
+                # Handle exit commands
+                if user_input.lower() in ("exit", "quit", "q"):
+                    ui.print_goodbye()
+                    break
+
+                # Run instruction
                 response = asyncio.run(run_instruction(user_input))
-                conversation_history.append({
-                    "role": "user",
-                    "content": user_input,
-                })
-                conversation_history.append({
-                    "role": "assistant",
-                    "content": response or "Task completed",
-                })
+                conversation_history.append({"role": "user", "content": user_input})
+                conversation_history.append({"role": "assistant", "content": response or "Done"})
 
             except KeyboardInterrupt:
-                click.echo("\n")
+                ui.console.print()
                 continue
             except EOFError:
-                click.echo("\nGoodbye!")
+                ui.print_goodbye()
                 break
 
     except KeyboardInterrupt:
-        click.echo("\n\nInterrupted by user", err=True)
+        ui.console.print("\n[yellow]Interrupted[/]")
         sys.exit(130)
     except Exception as e:
-        click.echo(f"\nError: {e}", err=True)
+        ui.print_error(str(e), recoverable=False)
         if verbose:
             import traceback
             traceback.print_exc()
         sys.exit(1)
 
 
-async def _apply_edits(
+async def _handle_edits(
     response: TarangResponse,
+    ui: TarangConsole,
     diff_applicator: DiffApplicator,
+    diff_viewer: DiffViewer,
     linter: ShadowLinter,
     client: TarangAPIClient,
+    project_path: Path,
     no_lint: bool,
     dry_run: bool,
+    auto_commit: bool,
 ) -> str:
-    """Apply edits from backend response."""
-    click.echo(f"\n{'─'*60}")
-    click.echo(f"Applying {len(response.edits)} edit(s):")
+    """Handle edits from backend response with preview."""
+    edits = [
+        {
+            "file": e.file,
+            "content": e.content,
+            "search": e.search,
+            "replace": e.replace,
+            "diff": e.diff,
+            "description": e.description,
+        }
+        for e in response.edits
+    ]
 
+    # Show preview and ask for confirmation
+    if not ui.print_edits_preview(edits):
+        ui.print_info("Changes cancelled")
+        return "Changes cancelled by user"
+
+    if dry_run:
+        ui.print_info("Dry run - no changes applied")
+        return "Dry run completed"
+
+    # Apply edits
     results = []
     for edit in response.edits:
-        click.echo(f"  • {edit.file}: {edit.description}")
-
-        if dry_run:
-            if edit.content:
-                click.echo(f"    [DRY-RUN] Would write {len(edit.content)} chars")
-            elif edit.search and edit.replace:
-                click.echo(f"    [DRY-RUN] Would replace: {edit.search[:50]}...")
-            elif edit.diff:
-                click.echo(f"    [DRY-RUN] Would apply diff")
-            continue
-
-        # Apply the edit
         if edit.content:
             result = diff_applicator.apply_content(edit.file, edit.content)
         elif edit.search and edit.replace:
-            result = diff_applicator.apply_search_replace(
-                edit.file, edit.search, edit.replace
-            )
+            result = diff_applicator.apply_search_replace(edit.file, edit.search, edit.replace)
         elif edit.diff:
             result = diff_applicator.apply_diff(edit.file, edit.diff)
         else:
-            click.echo(f"    [SKIP] No content to apply")
             continue
 
         results.append(result)
-
-        if result.success:
-            click.echo(f"    ✓ Applied")
-        else:
-            click.echo(f"    ✗ Failed: {result.error}")
-
-    if dry_run:
-        click.echo(f"{'─'*60}")
-        click.echo("[DRY-RUN] No changes made.\n")
-        return "Dry run completed"
+        ui.print_edit_result(edit.file, result.success, result.error)
 
     # Run linting
     lint_errors = []
     if not no_lint and results:
-        click.echo("\nVerifying changes...")
-
+        ui.print_info("Verifying changes...")
         for result in results:
             if result.success:
                 lint_result = linter.lint_file(result.path)
                 if not lint_result.success:
                     lint_errors.extend(lint_result.errors)
-                    click.echo(f"  ✗ Lint errors in {result.path}")
+                    ui.print_warning(f"Lint errors in {result.path}")
 
-    # Report feedback to backend
+    # Report feedback
     success = len(lint_errors) == 0
     if response.session_id:
         await client.report_feedback(
@@ -456,25 +420,23 @@ async def _apply_edits(
             lint_output="\n".join(lint_errors) if lint_errors else None,
         )
 
-    click.echo(f"{'─'*60}\n")
+    # Auto-commit if enabled
+    if auto_commit and success and any(r.success for r in results):
+        ui.git_commit(project_path, f"Tarang: {response.edits[0].description[:50] if response.edits else 'update'}")
 
+    applied = len([r for r in results if r.success])
     if lint_errors:
-        return f"Applied with {len(lint_errors)} lint error(s)"
-    return f"Applied {len([r for r in results if r.success])} edit(s)"
+        return f"Applied {applied} edit(s) with {len(lint_errors)} lint error(s)"
+    return f"Applied {applied} edit(s)"
 
 
-async def _run_commands(response: TarangResponse, project_path: Path) -> str:
+async def _run_commands(response: TarangResponse, project_path: Path, ui: TarangConsole) -> str:
     """Run shell commands from backend response."""
-    import subprocess
-
-    click.echo(f"\n{'─'*60}")
-    click.echo(f"Running {len(response.commands)} command(s):")
+    ui.console.print()
 
     for cmd in response.commands:
-        click.echo(f"\n$ {cmd.command}")
-
         if cmd.description:
-            click.echo(f"  ({cmd.description})")
+            ui.print_info(cmd.description)
 
         try:
             result = subprocess.run(
@@ -485,39 +447,27 @@ async def _run_commands(response: TarangResponse, project_path: Path) -> str:
                 timeout=cmd.timeout,
             )
 
-            if result.stdout:
-                click.echo(result.stdout.decode()[:500])
-            if result.stderr:
-                click.echo(result.stderr.decode()[:500], err=True)
-
-            if result.returncode != 0:
-                click.echo(f"  [Exit code: {result.returncode}]")
+            output = result.stdout.decode() + result.stderr.decode()
+            ui.print_command_output(cmd.command, output, result.returncode)
 
         except subprocess.TimeoutExpired:
-            click.echo("  [Timed out]", err=True)
+            ui.print_warning(f"Command timed out: {cmd.command}")
         except Exception as e:
-            click.echo(f"  [Error: {e}]", err=True)
+            ui.print_error(f"Command failed: {e}")
 
-    click.echo(f"{'─'*60}\n")
     return f"Ran {len(response.commands)} command(s)"
 
 
 @cli.command()
 @click.argument("query", required=True)
 def ask(query: str):
-    """
-    Quick question (no code generation).
-
-    For fast answers about coding concepts without project context.
-
-    Example:
-        tarang ask "what is a closure in Python?"
-    """
+    """Quick question without code generation."""
+    ui = get_console()
     auth = TarangAuth()
 
     if not auth.has_openrouter_key():
-        click.echo("OpenRouter key not set.", err=True)
-        click.echo("Run: tarang config --openrouter-key YOUR_KEY", err=True)
+        ui.print_error("OpenRouter key not set.")
+        ui.console.print("Run: [cyan]tarang config --openrouter-key YOUR_KEY[/]")
         sys.exit(1)
 
     creds = auth.load_credentials()
@@ -525,118 +475,98 @@ def ask(query: str):
     client.openrouter_key = creds.get("openrouter_key")
 
     try:
-        answer = asyncio.run(client.quick_ask(query))
-        click.echo(f"\n{answer}\n")
+        with ui.thinking("Thinking..."):
+            answer = asyncio.run(client.quick_ask(query))
+        ui.print_message(answer, title="Answer")
     except Exception as e:
-        click.echo(f"Error: {e}", err=True)
+        ui.print_error(str(e))
         sys.exit(1)
 
 
 @cli.command()
 def status():
-    """
-    Show Tarang status and configuration.
-
-    Displays authentication status and connectivity.
-    """
+    """Show Tarang status and configuration."""
+    ui = get_console()
     auth = TarangAuth()
     creds = auth.load_credentials() or {}
 
-    print_banner()
-    click.echo()
-    click.echo(f"v{__version__} Status")
-    click.echo(f"{'='*40}\n")
+    ui.console.print(f"\n[bold cyan]Tarang[/] v{__version__}")
+    ui.console.print("─" * 40)
 
     # Auth status
     if auth.is_authenticated():
-        click.echo("Authentication: ✓ Logged in")
+        ui.console.print("[green]✓[/] Authentication: Logged in")
     else:
-        click.echo("Authentication: ✗ Not logged in")
-        click.echo("  Run: tarang login")
+        ui.console.print("[red]✗[/] Authentication: Not logged in")
+        ui.console.print("  Run: [cyan]tarang login[/]")
 
     # OpenRouter key
     if auth.has_openrouter_key():
         key = creds.get("openrouter_key", "")
-        click.echo(f"OpenRouter Key: ✓ Configured ({key[:8]}...)")
+        ui.console.print(f"[green]✓[/] OpenRouter Key: {key[:12]}...")
     else:
-        click.echo("OpenRouter Key: ✗ Not set")
-        click.echo("  Run: tarang config --openrouter-key YOUR_KEY")
+        ui.console.print("[red]✗[/] OpenRouter Key: Not set")
+        ui.console.print("  Run: [cyan]tarang config --openrouter-key YOUR_KEY[/]")
 
     # Backend URL
     backend_url = creds.get("backend_url", TarangAPIClient.DEFAULT_BASE_URL)
-    click.echo(f"Backend URL: {backend_url}")
+    ui.console.print(f"[dim]Backend:[/] {backend_url}")
 
     # Test connectivity
-    click.echo("\nTesting connection...")
-    try:
-        import httpx
-        response = httpx.get(f"{backend_url}/health", timeout=5)
-        if response.status_code == 200:
-            click.echo("Backend: ✓ Connected")
-        else:
-            click.echo(f"Backend: ⚠ Status {response.status_code}")
-    except Exception as e:
-        click.echo(f"Backend: ✗ Cannot connect ({e})")
+    ui.console.print()
+    with ui.thinking("Testing connection..."):
+        try:
+            import httpx
+            response = httpx.get(f"{backend_url}/health", timeout=5)
+            if response.status_code == 200:
+                ui.print_success("Backend connected")
+            else:
+                ui.print_warning(f"Backend status: {response.status_code}")
+        except Exception as e:
+            ui.print_error(f"Cannot connect: {e}")
 
-    click.echo()
+    ui.console.print()
 
 
 @cli.command()
-@click.option(
-    "--project-dir", "-p",
-    default=".",
-    help="Project directory to clean",
-)
-@click.option(
-    "--force", "-f",
-    is_flag=True,
-    help="Don't ask for confirmation",
-)
+@click.option("--project-dir", "-p", default=".", help="Project directory")
+@click.option("--force", "-f", is_flag=True, help="Don't ask for confirmation")
 def clean(project_dir: str, force: bool):
-    """
-    Clean Tarang state from the project.
-
-    Removes the .tarang directory and backup files.
-    """
+    """Clean Tarang state from the project."""
+    ui = get_console()
     project_path = Path(project_dir).resolve()
     tarang_dir = project_path / ".tarang"
     backup_dir = project_path / ".tarang_backups"
 
     if not tarang_dir.exists() and not backup_dir.exists():
-        click.echo("No Tarang state to clean.")
+        ui.print_info("No Tarang state to clean.")
         return
 
-    if not force:
-        click.confirm(
-            f"Remove Tarang state from {project_path}?",
-            abort=True,
-        )
+    if not force and not ui.confirm(f"Remove Tarang state from {project_path}?"):
+        return
 
     if tarang_dir.exists():
         shutil.rmtree(tarang_dir)
-        click.echo("Removed .tarang directory")
+        ui.print_success("Removed .tarang directory")
 
     if backup_dir.exists():
         shutil.rmtree(backup_dir)
-        click.echo("Removed .tarang_backups directory")
-
-    click.echo("Done.")
+        ui.print_success("Removed .tarang_backups directory")
 
 
 @cli.command()
 def logout():
-    """
-    Log out and clear saved credentials.
-    """
+    """Log out and clear saved credentials."""
+    ui = get_console()
     auth = TarangAuth()
 
     if not auth.is_authenticated():
-        click.echo("Not logged in.")
+        ui.print_info("Not logged in.")
         return
 
-    if click.confirm("Clear all saved credentials?"):
+    if ui.confirm("Clear all saved credentials?"):
         auth.clear_credentials()
-        click.echo("Logged out. Credentials cleared.")
+        ui.print_success("Logged out. Credentials cleared.")
 
 
 def main():
