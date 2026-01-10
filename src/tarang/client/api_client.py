@@ -232,3 +232,161 @@ class TarangAPIClient:
             response.raise_for_status()
             data = response.json()
             return data.get("answer", "")
+
+    # ==========================================
+    # SESSION TRACKING
+    # ==========================================
+
+    async def create_session(
+        self,
+        instruction: str,
+        project_name: Optional[str] = None,
+        project_path: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Create a new session in the backend.
+
+        Args:
+            instruction: User's instruction
+            project_name: Name of the project
+            project_path: Path to the project
+
+        Returns:
+            Session ID if successful, None otherwise
+        """
+        payload = {
+            "instruction": instruction,
+            "project_name": project_name,
+            "project_path": project_path,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.base_url}/v2/sessions",
+                    json=payload,
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data.get("id")
+        except Exception:
+            # Session tracking is optional, don't fail the request
+            return None
+
+    async def update_session(
+        self,
+        session_id: str,
+        status: Optional[str] = None,
+        current_thought: Optional[str] = None,
+        error_message: Optional[str] = None,
+        applied_files: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Update session status.
+
+        Args:
+            session_id: Session ID to update
+            status: New status (thinking, executing, done, failed, etc.)
+            current_thought: Current thought/action
+            error_message: Error message if failed
+            applied_files: List of files that were modified
+
+        Returns:
+            True if successful
+        """
+        payload = {}
+        if status:
+            payload["status"] = status
+        if current_thought:
+            payload["current_thought"] = current_thought
+        if error_message:
+            payload["error_message"] = error_message
+        if applied_files:
+            payload["applied_files"] = applied_files
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.patch(
+                    f"{self.base_url}/v2/sessions/{session_id}",
+                    json=payload,
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return True
+        except Exception:
+            return False
+
+    async def add_session_event(
+        self,
+        session_id: str,
+        event_type: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Add an event to a session.
+
+        Args:
+            session_id: Session ID
+            event_type: Type of event (thought, action, result, error)
+            content: Event content
+            metadata: Optional metadata
+
+        Returns:
+            True if successful
+        """
+        payload = {
+            "type": event_type,
+            "content": content,
+            "metadata": metadata or {},
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.base_url}/v2/sessions/{session_id}/events",
+                    json=payload,
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return True
+        except Exception:
+            return False
+
+    async def update_session_usage(
+        self,
+        session_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int = 0,
+    ) -> bool:
+        """
+        Update token usage for a session.
+
+        Args:
+            session_id: Session ID
+            input_tokens: Number of input tokens
+            output_tokens: Number of output tokens
+            cached_tokens: Number of cached tokens
+
+        Returns:
+            True if successful
+        """
+        payload = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.base_url}/v2/sessions/{session_id}/usage",
+                    json=payload,
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return True
+        except Exception:
+            return False
