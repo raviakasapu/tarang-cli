@@ -444,7 +444,7 @@ class LocalToolExecutor:
     def _shell(self, args: dict) -> dict:
         """Execute a shell command."""
         command = args.get("command", "")
-        cwd = args.get("cwd", ".")
+        cwd = args.get("cwd") or "."
         timeout = args.get("timeout", 60)
 
         if not command:
@@ -514,6 +514,10 @@ class TarangStreamClient:
         self.project_root = project_root or os.getcwd()
         self.timeout = timeout
         self.current_task_id: Optional[str] = None
+
+        # Session-level approval settings
+        self._approve_all = False  # Approve all operations for this session
+        self._approved_tools: set = set()  # Approved tool types (e.g., "write_file", "edit_file")
 
         # Tool executor - can be overridden
         if on_tool_execute:
@@ -676,40 +680,53 @@ class TarangStreamClient:
 
         if require_approval:
             print(f"  [action] {tool}: {tool_arg}")
-            # Ask for user approval
-            try:
-                response = input("  Approve? [Y/n/v(iew)]: ").strip().lower()
-                if response == 'v':
-                    # Show full content/command
-                    if tool == "write_file":
-                        print(f"\n--- Content for {tool_arg} ---")
-                        print(args.get('content', ''))
-                        print("--- End ---\n")
-                    elif tool == "shell":
-                        print(f"\n  Command: {args.get('command', '')}\n")
-                    elif tool == "edit_file":
-                        print(f"\n  Search: {args.get('search', '')}")
-                        print(f"  Replace: {args.get('replace', '')}\n")
-                    response = input("  Approve? [Y/n]: ").strip().lower()
 
-                if response == 'n':
-                    result = {"skipped": True, "message": "User rejected operation"}
-                    print(f"  [tool] {tool}: SKIPPED by user")
-                    # Send skipped result
-                    callback_url = f"{self.base_url}/v2/v3/callback"
-                    callback_body = {
-                        "task_id": self.current_task_id,
-                        "call_id": call_id,
-                        "result": result,
-                    }
-                    try:
-                        await client.post(callback_url, json=callback_body, headers={"Authorization": f"Bearer {self.token}"})
-                    except Exception:
-                        pass
+            # Check if already approved for session or tool type
+            if self._approve_all or tool in self._approved_tools:
+                print(f"  [auto-approved]")
+            else:
+                # Ask for user approval
+                try:
+                    response = input("  Approve? [Y/n/a(ll)/t(ool)/v(iew)]: ").strip().lower()
+                    if response == 'v':
+                        # Show full content/command
+                        if tool == "write_file":
+                            print(f"\n--- Content for {tool_arg} ---")
+                            print(args.get('content', ''))
+                            print("--- End ---\n")
+                        elif tool == "shell":
+                            print(f"\n  Command: {args.get('command', '')}\n")
+                        elif tool == "edit_file":
+                            print(f"\n  Search: {args.get('search', '')}")
+                            print(f"  Replace: {args.get('replace', '')}\n")
+                        response = input("  Approve? [Y/n/a(ll)/t(ool)]: ").strip().lower()
+
+                    if response == 'a':
+                        # Approve all for this session
+                        self._approve_all = True
+                        print("  [approved all for session]")
+                    elif response == 't':
+                        # Approve all of this tool type
+                        self._approved_tools.add(tool)
+                        print(f"  [approved all '{tool}' for session]")
+                    elif response == 'n':
+                        result = {"skipped": True, "message": "User rejected operation"}
+                        print(f"  [tool] {tool}: SKIPPED by user")
+                        # Send skipped result
+                        callback_url = f"{self.base_url}/v2/v3/callback"
+                        callback_body = {
+                            "task_id": self.current_task_id,
+                            "call_id": call_id,
+                            "result": result,
+                        }
+                        try:
+                            await client.post(callback_url, json=callback_body, headers={"Authorization": f"Bearer {self.token}"})
+                        except Exception:
+                            pass
+                        return
+                except (EOFError, KeyboardInterrupt):
+                    print("\n  [tool] Operation cancelled")
                     return
-            except (EOFError, KeyboardInterrupt):
-                print("\n  [tool] Operation cancelled")
-                return
         else:
             print(f"  [tool] {tool}: {tool_arg}")
 
