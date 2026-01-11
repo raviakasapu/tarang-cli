@@ -413,9 +413,14 @@ async def _run_stream_session(
     4. When tool_request received, execute tool locally and POST /v3/callback
     5. Backend continues streaming after receiving callback
     6. Apply file changes locally when complete
+
+    Keyboard controls:
+    - ESC: Cancel current execution
+    - SPACE: Pause and add extra instruction
     """
     from tarang.context_collector import collect_context
     from tarang.stream import TarangStreamClient, EventType, FileChange
+    from tarang.ui.keyboard import KeyboardMonitor, KeyAction, create_keyboard_hints
 
     # Create stream client with project root for local tool execution
     client = TarangStreamClient(
@@ -426,8 +431,14 @@ async def _run_stream_session(
         verbose=verbose,
     )
 
+    # Create keyboard monitor
+    keyboard = KeyboardMonitor(
+        console=ui.console,
+        on_status=lambda msg: ui.console.print(msg)
+    )
+
     ui.console.print("[dim]Type your instructions, or /help for commands[/dim]")
-    ui.console.print("[dim]Press Ctrl+C to cancel[/dim]\n")
+    ui.console.print(f"[dim]{create_keyboard_hints()}[/dim]\n")
 
     while True:
         # Get instruction from user
@@ -462,9 +473,35 @@ async def _run_stream_session(
         ui.console.print()
         changes_to_apply = []
         current_phase = None
+        extra_instructions = []  # Queue of extra instructions from SPACE
+
+        # Start keyboard monitoring
+        keyboard.start()
 
         try:
             async for event in client.execute(instruction, context):
+                # Check for keyboard actions
+                action = keyboard.state.consume_action()
+
+                if action == KeyAction.CANCEL:
+                    ui.console.print("\n[yellow]⏹ Cancelling...[/yellow]")
+                    await client.cancel()
+                    break
+
+                elif action == KeyAction.PAUSE:
+                    # Stop monitoring temporarily for clean input
+                    keyboard.stop()
+                    ui.console.print("\n[bold cyan]━━━ Paused ━━━[/bold cyan]")
+                    try:
+                        extra = input("[cyan]Add instruction:[/cyan] ").strip()
+                        if extra:
+                            extra_instructions.append(extra)
+                            ui.console.print(f"[green]✓ Queued:[/green] {extra[:50]}...")
+                    except (KeyboardInterrupt, EOFError):
+                        pass
+                    ui.console.print("[bold cyan]━━━ Resuming ━━━[/bold cyan]\n")
+                    keyboard.start()
+
                 if event.type == EventType.STATUS:
                     msg = event.data.get("message", "Working...")
                     phase = event.data.get("phase", "")
@@ -574,9 +611,18 @@ async def _run_stream_session(
             ui.console.print("\n[yellow]Cancelling...[/yellow]")
             await client.cancel()
             ui.console.print("[yellow]Cancelled[/yellow]")
+            extra_instructions.clear()  # Clear queue on cancel
 
-        # Reset for next instruction
-        instruction = None
+        finally:
+            # Always stop keyboard monitoring
+            keyboard.stop()
+
+        # Process queued extra instructions or reset
+        if extra_instructions:
+            instruction = extra_instructions.pop(0)
+            ui.console.print(f"[cyan]→ Next queued:[/cyan] {instruction[:60]}...")
+        else:
+            instruction = None
 
 
 def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bool:

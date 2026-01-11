@@ -144,6 +144,15 @@ class LocalToolExecutor:
                 return self._delete_file(args)
             elif tool == "shell":
                 return self._shell(args)
+            # Validation tools
+            elif tool == "validate_file":
+                return self._validate_file(args)
+            elif tool == "validate_build":
+                return self._validate_build(args)
+            elif tool == "validate_structure":
+                return self._validate_structure(args)
+            elif tool == "lint_check":
+                return self._lint_check(args)
             else:
                 return {"error": f"Unknown tool: {tool}"}
         except Exception as e:
@@ -391,6 +400,17 @@ class LocalToolExecutor:
         if not search:
             return {"error": "search text required"}
 
+        # Pre-flight validation: Reject no-op edits (search === replace)
+        if search.strip() == replace.strip():
+            return {
+                "error": "STAGNATION ERROR: You attempted to replace text with identical text. "
+                         "The file has NOT changed. This indicates a logic loop. "
+                         "Please re-read the file to see its CURRENT state, "
+                         "or provide your final_answer if the task is complete.",
+                "success": False,
+                "stagnation": True,
+            }
+
         target = self.project_root / file_path
 
         if not target.exists():
@@ -401,7 +421,9 @@ class LocalToolExecutor:
 
             if search not in content:
                 return {
-                    "error": f"Search text not found in {file_path}",
+                    "error": f"Search text not found in {file_path}. "
+                             "The file may have already been modified. "
+                             "Use read_file to see the current content.",
                     "success": False,
                     "hint": "Make sure search text matches exactly including whitespace",
                 }
@@ -479,6 +501,275 @@ class LocalToolExecutor:
             if fnmatch.fnmatch(name, pattern):
                 return True
         return False
+
+    # ========================================================================
+    # Validation Tools
+    # ========================================================================
+
+    def _validate_file(self, args: dict) -> dict:
+        """
+        Validate that a file exists and contains expected patterns.
+
+        Args:
+            path: Path to file to validate
+            patterns: List of patterns that should exist in the file
+        """
+        path = args.get("path", "")
+        patterns = args.get("patterns", [])
+
+        if not path:
+            return {"error": "path required", "valid": False}
+
+        target = self.project_root / path
+
+        # Check file exists
+        if not target.exists():
+            return {
+                "valid": False,
+                "exists": False,
+                "path": path,
+                "message": f"File not found: {path}",
+            }
+
+        if not target.is_file():
+            return {
+                "valid": False,
+                "exists": True,
+                "is_file": False,
+                "path": path,
+                "message": f"Path is not a file: {path}",
+            }
+
+        # If no patterns, just confirm existence
+        if not patterns:
+            return {
+                "valid": True,
+                "exists": True,
+                "path": path,
+                "message": f"File exists: {path}",
+            }
+
+        # Check for patterns in content
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+            found_patterns = []
+            missing_patterns = []
+
+            for pattern in patterns:
+                if pattern in content:
+                    found_patterns.append(pattern)
+                else:
+                    missing_patterns.append(pattern)
+
+            valid = len(missing_patterns) == 0
+
+            return {
+                "valid": valid,
+                "exists": True,
+                "path": path,
+                "found_patterns": found_patterns,
+                "missing_patterns": missing_patterns,
+                "message": "All patterns found" if valid else f"Missing patterns: {missing_patterns}",
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "exists": True,
+                "path": path,
+                "error": str(e),
+            }
+
+    def _validate_build(self, args: dict) -> dict:
+        """
+        Run a build/compile command and check for success.
+
+        Args:
+            command: Build command to run (e.g., "npm run build", "cargo build")
+            timeout: Command timeout in seconds (default 120)
+        """
+        command = args.get("command", "")
+        timeout = args.get("timeout", 120)
+
+        if not command:
+            return {"error": "command required", "valid": False}
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+
+            success = result.returncode == 0
+
+            return {
+                "valid": success,
+                "exit_code": result.returncode,
+                "command": command,
+                "stdout": result.stdout[:3000] if result.stdout else "",
+                "stderr": result.stderr[:2000] if result.stderr else "",
+                "message": "Build passed" if success else f"Build failed with exit code {result.returncode}",
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "valid": False,
+                "exit_code": -1,
+                "command": command,
+                "message": f"Build timed out after {timeout}s",
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "exit_code": -1,
+                "command": command,
+                "error": str(e),
+            }
+
+    def _validate_structure(self, args: dict) -> dict:
+        """
+        Validate that expected files exist in the project.
+
+        Args:
+            expected_files: List of file paths that should exist
+            base_path: Base directory to check from (default ".")
+        """
+        expected_files = args.get("expected_files", [])
+        base_path = args.get("base_path", ".")
+
+        if not expected_files:
+            return {"error": "expected_files required", "valid": False}
+
+        base = self.project_root / base_path
+
+        found_files = []
+        missing_files = []
+
+        for file_path in expected_files:
+            target = base / file_path
+            if target.exists():
+                found_files.append(file_path)
+            else:
+                missing_files.append(file_path)
+
+        valid = len(missing_files) == 0
+
+        return {
+            "valid": valid,
+            "found_files": found_files,
+            "missing_files": missing_files,
+            "total_expected": len(expected_files),
+            "total_found": len(found_files),
+            "message": "All expected files found" if valid else f"Missing files: {missing_files}",
+        }
+
+    def _lint_check(self, args: dict) -> dict:
+        """
+        Run a linter to check code quality.
+
+        Args:
+            command: Lint command (auto-detected if empty)
+            file_path: Specific file to lint (optional)
+        """
+        command = args.get("command", "")
+        file_path = args.get("file_path", "")
+
+        # Auto-detect lint command based on project type
+        if not command:
+            command = self._detect_lint_command()
+            if not command:
+                return {
+                    "valid": True,
+                    "skipped": True,
+                    "message": "No linter detected for this project type",
+                }
+
+        # Add specific file to command if provided
+        if file_path:
+            command = f"{command} {file_path}"
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            # Most linters return 0 for clean code
+            success = result.returncode == 0
+
+            return {
+                "valid": success,
+                "exit_code": result.returncode,
+                "command": command,
+                "stdout": result.stdout[:3000] if result.stdout else "",
+                "stderr": result.stderr[:2000] if result.stderr else "",
+                "message": "Lint passed" if success else "Lint errors found",
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "valid": False,
+                "exit_code": -1,
+                "command": command,
+                "message": "Lint command timed out",
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "exit_code": -1,
+                "command": command,
+                "error": str(e),
+            }
+
+    def _detect_lint_command(self) -> str:
+        """Auto-detect the appropriate lint command for the project."""
+        # Check for Node.js project
+        package_json = self.project_root / "package.json"
+        if package_json.exists():
+            try:
+                import json
+                with open(package_json) as f:
+                    pkg = json.load(f)
+                scripts = pkg.get("scripts", {})
+                if "lint" in scripts:
+                    return "npm run lint"
+                if "eslint" in scripts:
+                    return "npm run eslint"
+            except Exception:
+                pass
+            # Check for eslint config
+            eslint_files = ["eslint.config.js", ".eslintrc", ".eslintrc.js", ".eslintrc.json"]
+            for f in eslint_files:
+                if (self.project_root / f).exists():
+                    return "npx eslint ."
+
+        # Check for Python project
+        pyproject = self.project_root / "pyproject.toml"
+        if pyproject.exists():
+            # Check for ruff or flake8 in pyproject.toml
+            try:
+                content = pyproject.read_text()
+                if "ruff" in content:
+                    return "ruff check ."
+                if "flake8" in content:
+                    return "flake8 ."
+            except Exception:
+                pass
+
+        # Check for Rust project
+        if (self.project_root / "Cargo.toml").exists():
+            return "cargo clippy"
+
+        # Check for Go project
+        if (self.project_root / "go.mod").exists():
+            return "go vet ./..."
+
+        return ""
 
 
 class TarangStreamClient:
