@@ -423,6 +423,7 @@ async def _run_stream_session(
         token=creds.get("token"),
         openrouter_key=creds.get("openrouter_key"),
         project_root=str(project_path),
+        verbose=verbose,
     )
 
     ui.console.print("[dim]Type your instructions, or /help for commands[/dim]")

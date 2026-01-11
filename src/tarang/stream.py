@@ -26,11 +26,13 @@ import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 import httpx
+from rich.console import Console
 
 from tarang.context_collector import ProjectContext
+from tarang.ui.formatter import OutputFormatter
 
 logger = logging.getLogger(__name__)
 
@@ -507,13 +509,19 @@ class TarangStreamClient:
         project_root: Optional[str] = None,
         timeout: float = 300.0,  # 5 minutes for long operations
         on_tool_execute: Optional[Callable[[str, dict], dict]] = None,
+        verbose: bool = False,
     ):
         self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
         self.token = token
         self.openrouter_key = openrouter_key
         self.project_root = project_root or os.getcwd()
         self.timeout = timeout
+        self.verbose = verbose
         self.current_task_id: Optional[str] = None
+
+        # Rich output formatter for consistent display
+        self.console = Console()
+        self.formatter = OutputFormatter(self.console, verbose=verbose)
 
         # Session-level approval settings
         self._approve_all = False  # Approve all operations for this session
@@ -660,58 +668,38 @@ class TarangStreamClient:
         tool = data.get("tool", "")
         args = data.get("args", {})
         require_approval = data.get("require_approval", False)
+        description = data.get("description", "")
 
         logger.info(f"[LOCAL] Executing tool: {tool} with args: {args} in {self.project_root}")
 
-        # Show tool info - prioritize the most relevant arg for each tool
-        if tool == "search_files":
-            tool_arg = args.get('pattern', '...')
-        elif tool == "shell":
-            tool_arg = args.get('command', '...')
-        elif tool == "write_file":
-            tool_arg = args.get('file_path', '...')
-            # Show content preview for write_file
-            content = args.get('content', '')
-            content_preview = content[:100] + "..." if len(content) > 100 else content
-            content_lines = content.count('\n') + 1
-            print(f"  [tool] {tool}: {tool_arg} ({content_lines} lines)")
-        else:
-            tool_arg = args.get('file_path', args.get('path', '...'))
+        # Show tool request with Rich formatting
+        self.formatter.show_tool_request(tool, args, require_approval, description)
 
         if require_approval:
-            print(f"  [action] {tool}: {tool_arg}")
-
             # Check if already approved for session or tool type
             if self._approve_all or tool in self._approved_tools:
-                print(f"  [auto-approved]")
+                self.formatter.show_approval_status("auto_approved")
             else:
                 # Ask for user approval
                 try:
-                    response = input("  Approve? [Y/n/a(ll)/t(ool)/v(iew)]: ").strip().lower()
+                    response = self.formatter.show_approval_prompt(tool, args)
+
                     if response == 'v':
                         # Show full content/command
-                        if tool == "write_file":
-                            print(f"\n--- Content for {tool_arg} ---")
-                            print(args.get('content', ''))
-                            print("--- End ---\n")
-                        elif tool == "shell":
-                            print(f"\n  Command: {args.get('command', '')}\n")
-                        elif tool == "edit_file":
-                            print(f"\n  Search: {args.get('search', '')}")
-                            print(f"  Replace: {args.get('replace', '')}\n")
-                        response = input("  Approve? [Y/n/a(ll)/t(ool)]: ").strip().lower()
+                        self.formatter.show_view_content(tool, args)
+                        response = self.formatter.show_approval_prompt(tool, args, "Y/n/a(ll)/t(ool)")
 
                     if response == 'a':
                         # Approve all for this session
                         self._approve_all = True
-                        print("  [approved all for session]")
+                        self.formatter.show_approval_status("approved_all")
                     elif response == 't':
                         # Approve all of this tool type
                         self._approved_tools.add(tool)
-                        print(f"  [approved all '{tool}' for session]")
+                        self.formatter.show_approval_status("approved_tool", tool)
                     elif response == 'n':
                         result = {"skipped": True, "message": "User rejected operation"}
-                        print(f"  [tool] {tool}: SKIPPED by user")
+                        self.formatter.show_approval_status("skipped")
                         # Send skipped result
                         callback_url = f"{self.base_url}/v2/v3/callback"
                         callback_body = {
@@ -725,45 +713,21 @@ class TarangStreamClient:
                             pass
                         return
                 except (EOFError, KeyboardInterrupt):
-                    print("\n  [tool] Operation cancelled")
+                    self.formatter.show_approval_status("cancelled")
                     return
-        else:
-            print(f"  [tool] {tool}: {tool_arg}")
 
         # Execute tool locally
         result = self._execute_tool(tool, args)
 
-        # Log result summary
-        if "error" in result:
-            logger.error(f"[LOCAL] Tool error: {result['error']}")
-            print(f"  [tool] {tool} error: {result['error']}")
-        else:
-            summary = ""
-            if "files" in result:
-                summary = f"{len(result['files'])} files"
-            elif "matches" in result:
-                summary = f"{len(result['matches'])} matches"
-            elif "content" in result:
-                summary = f"{len(result.get('content', ''))} chars"
-            elif "success" in result:
-                summary = "OK" if result.get("success") else "FAILED"
-            elif "exit_code" in result:
-                # Shell command result
-                code = result.get("exit_code", -1)
-                stdout = result.get("stdout", "")
-                summary = f"exit {code}"
-                if stdout:
-                    # Show first line of output
-                    first_line = stdout.strip().split('\n')[0][:50]
-                    summary += f" ({first_line}...)" if len(first_line) >= 50 else f" ({first_line})"
-            logger.info(f"[LOCAL] Tool result: {summary}")
-            print(f"  [tool] {tool} result: {summary}")
+        # Show result with Rich formatting
+        self.formatter.show_tool_result(tool, args, result)
+        logger.info(f"[LOCAL] Tool result: {result.get('success', 'completed')}")
 
         # Send result via callback
         callback_url = f"{self.base_url}/v2/v3/callback"
         callback_body = {
             "task_id": self.current_task_id,
-            "call_id": call_id,  # Use new name
+            "call_id": call_id,
             "result": result,
         }
 
@@ -777,13 +741,13 @@ class TarangStreamClient:
             )
             if resp.status_code != 200:
                 logger.error(f"Callback failed: {resp.status_code} - {resp.text}")
-                print(f"  [callback] FAILED: {resp.status_code}")
+                self.formatter.show_callback_status(False, f"{resp.status_code}")
             else:
                 logger.info(f"[LOCAL] Callback sent successfully")
-                print(f"  [callback] sent OK")
+                self.formatter.show_callback_status(True)
         except Exception as e:
             logger.error(f"Callback error: {e}")
-            print(f"  [callback] ERROR: {e}")
+            self.formatter.show_callback_status(False, str(e))
 
     async def cancel(self) -> bool:
         """Cancel the current task."""
