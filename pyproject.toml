@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarang"
-version = "3.1.0"
-description = "Tarang - AI Coding Agent (Thin Client with Local Execution)"
+version = "3.3.0"
+description = "Tarang - AI Coding Agent (Hybrid WebSocket Architecture)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]

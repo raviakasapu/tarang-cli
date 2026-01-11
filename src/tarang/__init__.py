@@ -1,23 +1,23 @@
 """
-Tarang - AI Coding Agent (Thin Client).
+Tarang - AI Coding Agent.
 
-A lightweight CLI that connects to the Tarang backend for AI-powered coding.
-The CLI handles local operations (files, shell) while the backend handles
-all reasoning and orchestration.
+Just type your instructions. The orchestrator handles everything:
+- Simple queries (explanations, questions)
+- Complex tasks (multi-step implementations)
+- Long-running jobs with phases and milestones
 
-Architecture (v3.0):
-- CLI: Sends context (skeleton, file contents) to backend
-- Backend: Reasons about code, returns instructions
-- CLI: Executes instructions locally (file edits, shell commands)
-
-This protects the backend's reasoning IP while enabling local file access.
+Architecture:
+- Backend: Runs agents with reasoning/planning (protected IP)
+- CLI: Executes tools locally via WebSocket (filesystem access)
+- WebSocket: Bidirectional real-time communication
 
 Usage:
-    tarang login                      # Authenticate
-    tarang config --openrouter-key    # Set API key
-    tarang run "explain the project"  # Run instruction
-    tarang                            # Interactive mode
+    tarang login                        # Authenticate
+    tarang config --openrouter-key KEY  # Set API key
+    tarang "explain the project"        # Run instruction
+    tarang "add user authentication"    # Build features
+    tarang                              # Interactive mode
 """
 
-__version__ = "3.1.0"
+__version__ = "3.3.0"
 __author__ = "Tarang Team"

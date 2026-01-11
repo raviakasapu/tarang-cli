@@ -1,32 +1,30 @@
 """
-Tarang CLI - AI coding assistant with rich terminal UI.
+Tarang CLI - AI coding assistant with hybrid WebSocket architecture.
 
-The CLI handles local operations (files, shell, git) while the backend
-handles all reasoning and orchestration.
+Just type your instructions. The orchestrator handles everything:
+- Simple queries (explanations, questions)
+- Complex tasks (multi-step implementations)
+- Long-running jobs with phases and milestones
 
 Usage:
-    tarang login                      # Authenticate with GitHub
-    tarang config --openrouter-key    # Set API key
-    tarang run "create a hello world" # Run instruction
-    tarang                            # Interactive mode
+    tarang login                        # Authenticate with GitHub
+    tarang config --openrouter-key KEY  # Set API key
+    tarang "explain the project"        # Run instruction
+    tarang                              # Interactive mode
 """
 from __future__ import annotations
 
 import asyncio
 import shutil
-import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 
 import click
 
 from tarang import __version__
-from tarang.client import TarangAPIClient, TarangAuth, TarangResponse
-from tarang.client.api_client import LocalContext, collect_relevant_files
-from tarang.context import SkeletonGenerator
-from tarang.executor import DiffApplicator, ShadowLinter
-from tarang.ui import TarangConsole, DiffViewer
+from tarang.client import TarangAPIClient, TarangAuth
+from tarang.ui import TarangConsole
 
 
 # Global console instance
@@ -42,20 +40,38 @@ def get_console(verbose: bool = False) -> TarangConsole:
 
 
 @click.group(invoke_without_command=True)
+@click.option("--project-dir", "-p", default=".", help="Project directory")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
+@click.option("--yes", "-y", is_flag=True, help="Auto-approve all operations")
 @click.version_option(version=__version__, prog_name="Tarang")
 @click.pass_context
-def cli(ctx):
+def cli(ctx, project_dir: str, verbose: bool, yes: bool):
     """
     Tarang - AI Coding Agent.
 
-    A thin CLI that connects to the Tarang backend for AI-powered coding.
+    Just type your instructions. The orchestrator handles everything:
+    - Simple queries (explanations, questions)
+    - Complex tasks (multi-step implementations)
+    - Long-running jobs with phases and milestones
 
     Quick start:
-        tarang login                   # Authenticate
-        tarang config --openrouter-key YOUR_KEY
-        tarang run "explain the project"
+        tarang login                        # Authenticate
+        tarang config --openrouter-key KEY  # Set API key
+        tarang run "explain the project"    # Run instruction
+        tarang                              # Interactive mode
+
+    Examples:
+        tarang run "add user authentication"
+        tarang run "fix the login bug"
+        tarang run "refactor the API" -y    # Auto-approve changes
     """
     if ctx.invoked_subcommand is None:
+        # Store options in context for the run function
+        ctx.ensure_object(dict)
+        ctx.obj["instruction"] = None
+        ctx.obj["project_dir"] = project_dir
+        ctx.obj["verbose"] = verbose
+        ctx.obj["auto_approve"] = yes
         ctx.invoke(run)
 
 
@@ -143,33 +159,26 @@ def config(openrouter_key: str, backend_url: str, show: bool):
 
 @cli.command()
 @click.argument("instruction", required=False)
-@click.option("--project-dir", "-p", default=".", help="Project directory")
-@click.option("--no-lint", is_flag=True, help="Skip linting after changes")
-@click.option("--dry-run", is_flag=True, help="Preview changes without applying")
+@click.option("--project-dir", "-p", default=None, help="Project directory")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
-@click.option("--once", is_flag=True, help="Run single instruction and exit")
-@click.option("--auto-commit", "-c", is_flag=True, help="Auto-commit after changes")
-def run(
-    instruction: str,
-    project_dir: str,
-    no_lint: bool,
-    dry_run: bool,
-    verbose: bool,
-    once: bool,
-    auto_commit: bool,
-):
+@click.option("--yes", "-y", is_flag=True, help="Auto-approve all operations")
+@click.pass_context
+def run(ctx, instruction: str, project_dir: str, verbose: bool, yes: bool):
     """
-    Run Tarang AI coding assistant.
-
-    Without instruction: starts interactive mode
-    With instruction: runs it and enters interactive mode (use --once to exit)
+    Run an instruction or start interactive mode.
 
     Examples:
-        tarang run                              # Interactive mode
-        tarang run "explain the project"        # Run then continue
-        tarang run "fix linter errors" --once   # Run and exit
-        tarang run "add login" --dry-run        # Preview changes
+        tarang run "explain the project"
+        tarang run "add authentication" -y
+        tarang run                           # Interactive mode
     """
+    # Get options from parent context or use provided ones
+    obj = ctx.obj or {}
+    instruction = instruction or obj.get("instruction")
+    project_dir = project_dir or obj.get("project_dir", ".")
+    verbose = verbose or obj.get("verbose", False)
+    auto_approve = yes or obj.get("auto_approve", False)
+
     ui = get_console(verbose)
     auth = TarangAuth()
 
@@ -189,134 +198,69 @@ def run(
         ui.print_error(f"Project directory not found: {project_dir}", recoverable=False)
         sys.exit(1)
 
-    # Initialize client
-    creds = auth.load_credentials()
-    client = TarangAPIClient(creds.get("backend_url"))
-    client.token = creds.get("token")
-    client.openrouter_key = creds.get("openrouter_key")
-
-    # Show banner and project info
+    # Show banner
     ui.print_banner(__version__, project_path)
 
-    with ui.thinking("Scanning project..."):
-        skeleton_gen = SkeletonGenerator(project_path)
-        skeleton = skeleton_gen.generate()
+    # Load credentials
+    creds = auth.load_credentials()
 
-    ui.print_project_stats(skeleton.total_files, skeleton.total_lines)
+    # Run the SSE stream session (simpler than WebSocket)
+    asyncio.run(_run_stream_session(
+        ui=ui,
+        creds=creds,
+        project_path=project_path,
+        instruction=instruction,
+        verbose=verbose,
+        auto_approve=auto_approve,
+    ))
 
-    # Build context
-    context = LocalContext(
-        project_root=str(project_path),
-        skeleton=skeleton.to_dict(),
+
+async def _run_hybrid_session(
+    ui: TarangConsole,
+    creds: dict,
+    project_path: Path,
+    instruction: Optional[str],
+    verbose: bool,
+    auto_approve: bool,
+):
+    """Run the hybrid WebSocket session."""
+    import signal
+    from tarang.ws import TarangWSClient, ToolExecutor, MessageHandlers
+
+    # Track if we're in the middle of execution
+    is_executing = False
+    cancelled = False
+
+    # Create WebSocket client
+    ws_client = TarangWSClient(
+        base_url=creds.get("backend_url"),
+        token=creds.get("token"),
+        openrouter_key=creds.get("openrouter_key"),
     )
 
-    # Initialize components
-    diff_applicator = DiffApplicator(project_path)
-    diff_viewer = DiffViewer(ui.console)
-    linter = ShadowLinter(project_path)
+    # Create tool executor
+    executor = ToolExecutor(project_root=str(project_path))
 
-    session_id = None
+    # Create approval callback
+    def on_approval(tool: str, description: str, args: dict) -> bool:
+        if auto_approve:
+            ui.console.print(f"  [dim]Auto-approved[/dim]")
+            return True
+        return ui.confirm(f"Apply?", default=True)
+
+    # Create message handlers
+    handlers = MessageHandlers(
+        console=ui.console,
+        executor=executor,
+        on_approval=on_approval,
+        verbose=verbose,
+        auto_approve=auto_approve,
+    )
+
     conversation_history: List[Dict[str, str]] = []
-    pending_changes: List[Dict[str, Any]] = []
-    project_name = project_path.name
-
-    async def run_instruction(instr: str) -> str:
-        """Run a single instruction and return response."""
-        nonlocal session_id, context, pending_changes
-
-        context.history = conversation_history[-6:]
-
-        # Create session in Supabase for tracking (if not already exists)
-        if session_id is None:
-            created_session = await client.create_session(
-                instruction=instr,
-                project_name=project_name,
-                project_path=str(project_path),
-            )
-            if created_session:
-                session_id = created_session.get("id")
-                if verbose:
-                    ui.print_info(f"Session: {session_id}")
-
-        # Collect relevant file contents for the backend to reason about
-        with ui.thinking("Collecting context..."):
-            file_contents = collect_relevant_files(
-                project_path=project_path,
-                instruction=instr,
-                skeleton=context.skeleton,
-                max_files=10,
-                max_size=50000,
-            )
-            context.file_contents = file_contents
-
-        with ui.thinking():
-            response = await client.execute(
-                instruction=instr,
-                context=context,
-                session_id=session_id,
-            )
-
-        session_id = response.session_id
-
-        # Handle response types
-        if response.type == "error":
-            ui.print_error(response.error or "Unknown error")
-            # Update session as failed
-            if session_id:
-                await client.update_session(
-                    session_id=session_id,
-                    status="failed",
-                    error_message=response.error,
-                )
-            return ""
-
-        if verbose and response.thought_process:
-            ui.print_thought(response.thought_process)
-
-        # Track token usage if available
-        if session_id and response.tokens_used > 0:
-            await client.update_session_usage(
-                session_id=session_id,
-                input_tokens=0,  # Backend doesn't split tokens yet
-                output_tokens=response.tokens_used,
-            )
-
-        # Handle edits
-        if response.type == "edits" and response.edits:
-            result = await _handle_edits(
-                response, ui, diff_applicator, diff_viewer, linter,
-                client, project_path, no_lint, dry_run, auto_commit
-            )
-            # Update session with applied files
-            if session_id:
-                applied_files = [e.file for e in response.edits]
-                await client.update_session(
-                    session_id=session_id,
-                    status="done",
-                    applied_files=applied_files,
-                )
-            return result
-
-        # Handle commands
-        if response.type == "command" and response.commands:
-            result = await _run_commands(response, project_path, ui)
-            # Update session as done
-            if session_id:
-                await client.update_session(session_id=session_id, status="done")
-            return result
-
-        # Handle message
-        if response.message:
-            ui.print_message(response.message)
-            # Update session as done for message responses
-            if session_id:
-                await client.update_session(session_id=session_id, status="done")
-            return response.message
-
-        return ""
 
     def handle_slash_command(cmd: str) -> bool:
-        """Handle slash commands. Returns True if command was handled."""
+        """Handle slash commands."""
         cmd = cmd.lower().strip()
 
         if cmd in ("/help", "/h", "/?"):
@@ -340,62 +284,108 @@ def run(
             ui.print_success("Conversation history cleared")
             return True
 
-        if cmd in ("/session", "/info"):
-            ui.print_session_info(session_id, len(conversation_history))
-            return True
-
         if cmd in ("/exit", "/quit", "/q"):
             ui.print_goodbye()
             sys.exit(0)
 
         return False
 
-    try:
-        # Run initial instruction if provided
-        if instruction:
-            response = asyncio.run(run_instruction(instruction))
-            conversation_history.append({"role": "user", "content": instruction})
-            conversation_history.append({"role": "assistant", "content": response or "Done"})
-
-            if once:
-                ui.print_success("Task completed")
-                return
-
-        # Interactive mode
-        if not once:
-            ui.console.print("[dim]Type your instructions, or /help for commands[/dim]\n")
-
-        while not once:
+    async def send_cancel():
+        """Send cancel message to backend."""
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
             try:
-                user_input = ui.prompt_input()
+                await ws_client.cancel()
+                ui.console.print("\n[yellow]⏹ Cancelling...[/yellow]")
+            except Exception:
+                pass
 
-                if not user_input.strip():
-                    continue
+    try:
+        async with ws_client:
+            if verbose:
+                ui.console.print(f"[dim]Session: {ws_client.session_id}[/dim]")
 
-                # Handle slash commands
-                if user_input.startswith("/"):
-                    if handle_slash_command(user_input):
-                        continue
+            ui.console.print("[dim]Type your instructions, or /help for commands[/dim]")
+            ui.console.print("[dim]Press Ctrl+C during execution to cancel[/dim]\n")
 
-                # Handle exit commands
-                if user_input.lower() in ("exit", "quit", "q"):
-                    ui.print_goodbye()
-                    break
+            # Run initial instruction if provided
+            instr = instruction
+            while True:
+                cancelled = False
 
-                # Run instruction
-                response = asyncio.run(run_instruction(user_input))
-                conversation_history.append({"role": "user", "content": user_input})
-                conversation_history.append({"role": "assistant", "content": response or "Done"})
+                if not instr:
+                    # Get instruction from user
+                    try:
+                        instr = ui.prompt_input()
+                        if not instr.strip():
+                            continue
 
-            except KeyboardInterrupt:
+                        # Handle slash commands
+                        if instr.startswith("/"):
+                            if handle_slash_command(instr):
+                                instr = None
+                                continue
+
+                        # Handle exit
+                        if instr.lower() in ("exit", "quit", "q"):
+                            ui.print_goodbye()
+                            break
+
+                    except (KeyboardInterrupt, EOFError):
+                        ui.print_goodbye()
+                        break
+
+                # Execute instruction via WebSocket
                 ui.console.print()
-                continue
-            except EOFError:
-                ui.print_goodbye()
-                break
+                is_executing = True
 
+                try:
+                    async for event in ws_client.execute(instr, str(project_path)):
+                        if cancelled:
+                            ui.console.print("[yellow]Execution cancelled[/yellow]")
+                            break
+
+                        should_continue = await handlers.handle(event, ws_client)
+                        if not should_continue:
+                            break
+
+                except KeyboardInterrupt:
+                    # Ctrl+C during execution
+                    await send_cancel()
+                    ui.console.print()
+
+                    # Show what was completed
+                    summary = handlers.get_summary()
+                    if summary.get("files_changed"):
+                        ui.console.print("[dim]Files changed before cancellation:[/dim]")
+                        for f in summary["files_changed"]:
+                            ui.console.print(f"  [dim]- {f}[/dim]")
+
+                finally:
+                    is_executing = False
+
+                # Track conversation (even if cancelled)
+                summary = handlers.get_summary()
+                if instr:
+                    conversation_history.append({"role": "user", "content": instr})
+                    status = "Cancelled" if cancelled else "Done"
+                    conversation_history.append({"role": "assistant", "content": status})
+
+                # Reset for next instruction
+                instr = None
+                handlers.state = type(handlers.state)()
+
+    except ConnectionError as e:
+        ui.print_error(f"Connection failed: {e}")
+        ui.console.print("[dim]Make sure the backend is running.[/dim]")
+        sys.exit(1)
     except KeyboardInterrupt:
-        ui.console.print("\n[yellow]Interrupted[/]")
+        if is_executing:
+            ui.console.print("\n[yellow]⏹ Cancelled[/yellow]")
+        else:
+            ui.console.print()
+            ui.print_goodbye()
         sys.exit(130)
     except Exception as e:
         ui.print_error(str(e), recoverable=False)
@@ -405,136 +395,258 @@ def run(
         sys.exit(1)
 
 
-async def _handle_edits(
-    response: TarangResponse,
+async def _run_stream_session(
     ui: TarangConsole,
-    diff_applicator: DiffApplicator,
-    diff_viewer: DiffViewer,
-    linter: ShadowLinter,
-    client: TarangAPIClient,
+    creds: dict,
     project_path: Path,
-    no_lint: bool,
-    dry_run: bool,
-    auto_commit: bool,
-) -> str:
-    """Handle edits from backend response with preview."""
-    # Build preview data using helper methods for search/replace
-    edits = [
-        {
-            "file": e.file,
-            "content": e.content,
-            "search": e.get_search(),  # Use helper method
-            "replace": e.get_replace(),  # Use helper method
-            "diff": e.diff,
-            "description": e.description,
-        }
-        for e in response.edits
-    ]
+    instruction: Optional[str],
+    verbose: bool,
+    auto_approve: bool,
+):
+    """
+    Run the SSE + REST callback session.
 
-    # Show preview and ask for confirmation
-    if not ui.print_edits_preview(edits):
-        ui.print_info("Changes cancelled")
-        return "Changes cancelled by user"
+    Flow:
+    1. Collect local context (file list, relevant files)
+    2. Send POST /v3/execute with instruction + context
+    3. Backend streams SSE events (status, tool_request, plan, change, etc.)
+    4. When tool_request received, execute tool locally and POST /v3/callback
+    5. Backend continues streaming after receiving callback
+    6. Apply file changes locally when complete
+    """
+    from tarang.context_collector import collect_context
+    from tarang.stream import TarangStreamClient, EventType, FileChange
 
-    if dry_run:
-        ui.print_info("Dry run - no changes applied")
-        return "Dry run completed"
+    # Create stream client with project root for local tool execution
+    client = TarangStreamClient(
+        base_url=creds.get("backend_url"),
+        token=creds.get("token"),
+        openrouter_key=creds.get("openrouter_key"),
+        project_root=str(project_path),
+    )
 
-    # Apply edits
-    results = []
-    for edit in response.edits:
-        search_text = edit.get_search()
-        replace_text = edit.get_replace()
+    ui.console.print("[dim]Type your instructions, or /help for commands[/dim]")
+    ui.console.print("[dim]Press Ctrl+C to cancel[/dim]\n")
 
-        if edit.content:
-            result = diff_applicator.apply_content(edit.file, edit.content)
-        elif search_text and replace_text:
-            result = diff_applicator.apply_search_replace(edit.file, search_text, replace_text)
-        elif edit.diff:
-            result = diff_applicator.apply_diff(edit.file, edit.diff)
-        else:
-            continue
+    while True:
+        # Get instruction from user
+        if not instruction:
+            try:
+                instruction = ui.prompt_input()
+                if not instruction.strip():
+                    continue
 
-        results.append(result)
-        ui.print_edit_result(edit.file, result.success, result.error)
+                # Handle slash commands
+                if instruction.startswith("/"):
+                    if _handle_slash_command(ui, instruction, project_path):
+                        instruction = None
+                        continue
 
-    # Run linting
-    lint_errors = []
-    if not no_lint and results:
-        ui.print_info("Verifying changes...")
-        for result in results:
-            if result.success:
-                lint_result = linter.lint_file(result.path)
-                if not lint_result.success:
-                    lint_errors.extend(lint_result.errors)
-                    ui.print_warning(f"Lint errors in {result.path}")
+                # Handle exit
+                if instruction.lower() in ("exit", "quit", "q"):
+                    ui.print_goodbye()
+                    break
 
-    # Report feedback
-    success = len(lint_errors) == 0
-    if response.session_id:
-        await client.report_feedback(
-            session_id=response.session_id,
-            success=success,
-            applied_edits=[r.path for r in results if r.success],
-            lint_output="\n".join(lint_errors) if lint_errors else None,
-        )
+            except (KeyboardInterrupt, EOFError):
+                ui.print_goodbye()
+                break
 
-    # Auto-commit if enabled
-    if auto_commit and success and any(r.success for r in results):
-        ui.git_commit(project_path, f"Tarang: {response.edits[0].description[:50] if response.edits else 'update'}")
+        # Collect local context (for initial context in request)
+        ui.console.print("[dim]Collecting context...[/dim]")
+        context = collect_context(str(project_path), instruction)
+        if verbose:
+            ui.console.print(f"[dim]Found {len(context.files)} files, {len(context.relevant_files)} relevant[/dim]")
 
-    applied = len([r for r in results if r.success])
-    if lint_errors:
-        return f"Applied {applied} edit(s) with {len(lint_errors)} lint error(s)"
-    return f"Applied {applied} edit(s)"
-
-
-async def _run_commands(response: TarangResponse, project_path: Path, ui: TarangConsole) -> str:
-    """Run shell commands from backend response."""
-    ui.console.print()
-
-    commands_run = 0
-    commands_skipped = 0
-
-    for cmd in response.commands:
-        # Show description
-        if cmd.description:
-            ui.print_info(cmd.description)
-
-        # Ask for confirmation if required
-        if cmd.require_confirmation:
-            ui.console.print(f"[yellow]Command:[/] {cmd.command}")
-            if not ui.confirm("Run this command?", default=True):
-                ui.print_info("Skipped")
-                commands_skipped += 1
-                continue
-
-        # Determine working directory
-        cwd = project_path
-        if cmd.working_dir:
-            cwd = project_path / cmd.working_dir
+        # Stream execution with tool callbacks
+        ui.console.print()
+        changes_to_apply = []
+        current_phase = None
 
         try:
-            result = subprocess.run(
-                cmd.command,
-                shell=True,
-                cwd=cwd,
-                capture_output=True,
-                timeout=cmd.timeout,
-            )
+            async for event in client.execute(instruction, context):
+                if event.type == EventType.STATUS:
+                    msg = event.data.get("message", "Working...")
+                    phase = event.data.get("phase", "")
 
-            output = result.stdout.decode() + result.stderr.decode()
-            ui.print_command_output(cmd.command, output, result.returncode)
-            commands_run += 1
+                    # Show phase transitions
+                    if phase and phase != current_phase:
+                        current_phase = phase
+                        phase_icons = {"explore": "🔍", "plan": "📋", "implement": "⚡", "generate": "✨"}
+                        icon = phase_icons.get(phase, "•")
+                        ui.console.print(f"[cyan]{icon} {phase.title()}[/cyan]")
 
-        except subprocess.TimeoutExpired:
-            ui.print_warning(f"Command timed out after {cmd.timeout}s: {cmd.command}")
-        except Exception as e:
-            ui.print_error(f"Command failed: {e}")
+                    if verbose:
+                        ui.console.print(f"[dim]{msg}[/dim]")
 
-    if commands_skipped > 0:
-        return f"Ran {commands_run} command(s), skipped {commands_skipped}"
-    return f"Ran {commands_run} command(s)"
+                elif event.type == EventType.THINKING:
+                    # Agent thinking/reasoning
+                    msg = event.data.get("message", "Thinking...")
+                    iteration = event.data.get("iteration", 0)
+                    if verbose:
+                        ui.console.print(f"[dim cyan]💭 {msg}[/dim cyan]")
+                    else:
+                        # Show minimal thinking indicator
+                        ui.console.print(f"[dim]• {msg}[/dim]")
+
+                elif event.type == EventType.TOOL_DONE:
+                    # Tool execution completed (already handled internally)
+                    tool = event.data.get("tool", "")
+                    if verbose:
+                        ui.console.print(f"[dim]  ✓ {tool}[/dim]")
+
+                elif event.type == EventType.PLAN:
+                    desc = event.data.get("description", "")
+                    steps = event.data.get("steps", [])
+                    files = event.data.get("files", [])
+
+                    if desc:
+                        ui.console.print(f"\n[bold]Plan:[/bold] {desc}")
+                    if steps:
+                        ui.console.print("[dim]Steps:[/dim]")
+                        for i, step in enumerate(steps[:5], 1):
+                            ui.console.print(f"  {i}. {step}")
+                    if files:
+                        ui.console.print("[dim]Files to modify:[/dim]")
+                        for f in files[:10]:
+                            ui.console.print(f"  • {f}")
+
+                elif event.type == EventType.CHANGE:
+                    change = FileChange.from_dict(event.data)
+                    changes_to_apply.append(change)
+
+                    # Show change preview
+                    icon = "📝" if change.type == "edit" else "📄"
+                    ui.console.print(f"\n[bold yellow]{icon} {change.type.title()}: {change.path}[/bold yellow]")
+                    if change.description:
+                        ui.console.print(f"[dim]{change.description}[/dim]")
+
+                    if change.type == "create" and change.content:
+                        # Show preview of new file
+                        lines = change.content.splitlines()[:15]
+                        preview = "\n".join(lines)
+                        if len(change.content.splitlines()) > 15:
+                            preview += "\n... (truncated)"
+                        ui.console.print(f"[dim]```\n{preview}\n```[/dim]")
+
+                    elif change.type == "edit" and change.search and change.replace:
+                        # Show diff preview
+                        search_preview = change.search[:100] + "..." if len(change.search) > 100 else change.search
+                        replace_preview = change.replace[:100] + "..." if len(change.replace) > 100 else change.replace
+                        ui.console.print(f"[red]- {search_preview}[/red]")
+                        ui.console.print(f"[green]+ {replace_preview}[/green]")
+
+                elif event.type == EventType.CONTENT:
+                    # Text response (for queries)
+                    content = event.data.get("text", "")
+                    ui.print_message(content, title="Answer")
+
+                elif event.type == EventType.ERROR:
+                    msg = event.data.get("message", "Unknown error")
+                    ui.print_error(msg)
+
+                elif event.type == EventType.COMPLETE:
+                    if verbose:
+                        ui.console.print("[dim]✓ Complete[/dim]")
+
+            # Apply changes
+            if changes_to_apply:
+                ui.console.print(f"\n[bold]Ready to apply {len(changes_to_apply)} change(s)[/bold]")
+
+                for change in changes_to_apply:
+                    if not auto_approve:
+                        if not ui.confirm(f"Apply {change.type} to {change.path}?", default=True):
+                            ui.console.print(f"[dim]Skipped: {change.path}[/dim]")
+                            continue
+
+                    # Apply the change
+                    success = _apply_change(project_path, change, ui)
+                    if success:
+                        ui.console.print(f"[green]✓[/green] Applied: {change.path}")
+                    else:
+                        ui.console.print(f"[red]✗[/red] Failed: {change.path}")
+
+                ui.console.print("\n[green]Done![/green]\n")
+            else:
+                ui.console.print()
+
+        except KeyboardInterrupt:
+            ui.console.print("\n[yellow]Cancelling...[/yellow]")
+            await client.cancel()
+            ui.console.print("[yellow]Cancelled[/yellow]")
+
+        # Reset for next instruction
+        instruction = None
+
+
+def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bool:
+    """Handle slash commands. Returns True if handled."""
+    cmd = cmd.lower().strip()
+
+    if cmd in ("/help", "/h", "/?"):
+        ui.print_help()
+        return True
+
+    if cmd in ("/git", "/status"):
+        ui.print_git_status(project_path)
+        return True
+
+    if cmd in ("/commit", "/c"):
+        ui.git_commit(project_path)
+        return True
+
+    if cmd in ("/diff", "/d"):
+        ui.git_diff(project_path)
+        return True
+
+    if cmd == "/clear":
+        ui.console.print("[green]Ready for new instructions[/green]")
+        return True
+
+    if cmd in ("/exit", "/quit", "/q"):
+        ui.print_goodbye()
+        sys.exit(0)
+
+    return False
+
+
+def _apply_change(project_path: Path, change, ui: TarangConsole) -> bool:
+    """Apply a file change locally."""
+    from tarang.stream import FileChange
+
+    file_path = project_path / change.path
+
+    try:
+        if change.type == "create":
+            # Create parent directories
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(change.content or "", encoding="utf-8")
+            return True
+
+        elif change.type == "edit":
+            if not file_path.exists():
+                ui.console.print(f"[red]File not found: {change.path}[/red]")
+                return False
+
+            content = file_path.read_text(encoding="utf-8")
+
+            if change.search and change.search not in content:
+                ui.console.print(f"[red]Search text not found in {change.path}[/red]")
+                return False
+
+            new_content = content.replace(change.search, change.replace or "", 1)
+            file_path.write_text(new_content, encoding="utf-8")
+            return True
+
+        elif change.type == "delete":
+            if file_path.exists():
+                file_path.unlink()
+            return True
+
+        return False
+
+    except Exception as e:
+        ui.console.print(f"[red]Error applying change: {e}[/red]")
+        return False
 
 
 @cli.command()

@@ -103,6 +103,11 @@ class LocalContext:
     git_status: Optional[str] = None
     history: List[Dict[str, str]] = field(default_factory=list)
 
+    @property
+    def cwd(self) -> str:
+        """Alias for project_root (for backend compatibility)."""
+        return self.project_root
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "cwd": self.project_root,
@@ -494,7 +499,50 @@ def collect_relevant_files(
                 files.append(path)
         return files
 
-    all_files = find_files_in_skeleton(skeleton)
+    def parse_file_tree(file_tree: str) -> List[str]:
+        """Parse ASCII file tree to extract file paths."""
+        files = []
+        path_stack = []
+
+        for line in file_tree.split("\n"):
+            if not line.strip():
+                continue
+
+            # Remove tree characters and get the name
+            # Handles: "├── ", "└── ", "│   ", "    "
+            clean_line = line
+            for char in ["├", "└", "│", "─", " "]:
+                clean_line = clean_line.replace(char, "")
+
+            name = clean_line.strip()
+            if not name:
+                continue
+
+            # Calculate depth based on indentation
+            # Each level is typically 4 chars ("│   " or "    ")
+            stripped = line.lstrip("│ ")
+            indent = len(line) - len(stripped)
+            depth = indent // 4
+
+            # Adjust path stack
+            while len(path_stack) > depth:
+                path_stack.pop()
+
+            if name.endswith("/"):
+                # It's a directory
+                path_stack.append(name.rstrip("/"))
+            else:
+                # It's a file
+                full_path = "/".join(path_stack + [name]) if path_stack else name
+                files.append(full_path)
+
+        return files
+
+    # Check if skeleton uses new format (file_tree string) or old format (nested dict)
+    if "file_tree" in skeleton:
+        all_files = parse_file_tree(skeleton.get("file_tree", ""))
+    else:
+        all_files = find_files_in_skeleton(skeleton)
 
     # Find files mentioned in instruction
     for file_path in all_files:
@@ -529,3 +577,125 @@ def collect_relevant_files(
                 pass
 
     return file_contents
+
+
+class StreamingEvent:
+    """Event received from WebSocket stream."""
+
+    def __init__(self, event_type: str, data: Dict[str, Any]):
+        self.type = event_type
+        self.data = data
+
+    def __repr__(self) -> str:
+        return f"StreamingEvent(type={self.type}, data={self.data})"
+
+
+class TarangStreamingClient:
+    """WebSocket client for real-time streaming from Tarang backend."""
+
+    def __init__(self, base_url: Optional[str] = None):
+        """Initialize the streaming client.
+
+        Args:
+            base_url: Backend base URL (will convert http to ws)
+        """
+        http_url = base_url or TarangAPIClient.DEFAULT_BASE_URL
+        # Convert http(s) to ws(s)
+        if http_url.startswith("https://"):
+            self.ws_url = http_url.replace("https://", "wss://")
+        elif http_url.startswith("http://"):
+            self.ws_url = http_url.replace("http://", "ws://")
+        else:
+            self.ws_url = f"wss://{http_url}"
+
+        self.token: Optional[str] = None
+        self.openrouter_key: Optional[str] = None
+
+    async def stream_execute(
+        self,
+        instruction: str,
+        context: LocalContext,
+        session_id: Optional[str] = None,
+    ) -> AsyncIterator[StreamingEvent]:
+        """
+        Execute instruction with streaming events.
+
+        Yields events as they arrive from the backend.
+
+        Args:
+            instruction: User instruction
+            context: Project context
+            session_id: Optional session ID
+
+        Yields:
+            StreamingEvent for each event from backend
+        """
+        import websockets
+
+        # Build WebSocket URL with auth
+        ws_endpoint = f"{self.ws_url}/v2/ws/execute"
+        params = []
+        if self.token:
+            params.append(f"token={self.token}")
+        if self.openrouter_key:
+            params.append(f"openrouter_key={self.openrouter_key}")
+        if params:
+            ws_endpoint = f"{ws_endpoint}?{'&'.join(params)}"
+
+        try:
+            async with websockets.connect(
+                ws_endpoint,
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=5,
+            ) as websocket:
+                # Wait for connected event
+                response = await websocket.recv()
+                event = json.loads(response)
+                yield StreamingEvent(event.get("type", "unknown"), event.get("data", {}))
+
+                # Send execute request
+                execute_request = {
+                    "type": "execute",
+                    "message": instruction,
+                    "context": {
+                        "skeleton": context.skeleton,
+                        "cwd": context.cwd,
+                        "history": context.history,
+                        "file_contents": context.file_contents,
+                    },
+                }
+                await websocket.send(json.dumps(execute_request))
+
+                # Stream events
+                while True:
+                    try:
+                        response = await websocket.recv()
+                        event = json.loads(response)
+                        event_type = event.get("type", "unknown")
+                        event_data = event.get("data", {})
+
+                        yield StreamingEvent(event_type, event_data)
+
+                        # Check for terminal events
+                        if event_type in ("complete", "error"):
+                            break
+
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+
+        except Exception as e:
+            yield StreamingEvent("error", {"message": str(e)})
+
+    async def send_approval(
+        self,
+        websocket,
+        approved: bool,
+    ) -> None:
+        """Send approval response for an edit."""
+        import websockets
+
+        await websocket.send(json.dumps({
+            "type": "approve",
+            "approved": approved,
+        }))
