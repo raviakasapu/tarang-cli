@@ -593,23 +593,7 @@ async def _run_stream_session(
 
                 elif event.type == EventType.CONTENT:
                     # Text response (for queries)
-                    # Handle structured response: {operation, payload, human_readable_summary}
-                    data = event.data
-
-                    # Extract the actual message content
-                    if isinstance(data, dict):
-                        content = (
-                            data.get("human_readable_summary") or
-                            data.get("text") or
-                            data.get("payload", {}).get("message") or
-                            data.get("message") or
-                            str(data)
-                        )
-                    elif isinstance(data, str):
-                        content = data
-                    else:
-                        content = str(data)
-
+                    content = _extract_content(event.data)
                     ui.print_message(content, title="Answer")
 
                 elif event.type == EventType.ERROR:
@@ -746,6 +730,54 @@ def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bo
         return True
 
     return False
+
+
+def _extract_content(data) -> str:
+    """
+    Extract human-readable content from event data.
+
+    Handles various formats:
+    - Dict with human_readable_summary
+    - Dict with text field
+    - Dict with payload.message
+    - String that looks like a dict
+    - Plain string
+    """
+    import ast
+    import json
+
+    # If it's a string, try to parse it as dict
+    if isinstance(data, str):
+        # Try JSON first
+        try:
+            data = json.loads(data)
+        except (json.JSONDecodeError, ValueError):
+            # Try Python literal (handles single quotes)
+            try:
+                data = ast.literal_eval(data)
+            except (ValueError, SyntaxError):
+                # It's just a plain string
+                return data
+
+    # Now data should be a dict
+    if isinstance(data, dict):
+        # Priority order for extraction
+        if "human_readable_summary" in data:
+            return data["human_readable_summary"]
+        if "text" in data:
+            # text might itself be a nested structure
+            return _extract_content(data["text"])
+        if "payload" in data and isinstance(data["payload"], dict):
+            if "message" in data["payload"]:
+                return data["payload"]["message"]
+        if "message" in data:
+            return data["message"]
+        if "content" in data:
+            return data["content"]
+        # Fallback - return as formatted string
+        return str(data)
+
+    return str(data)
 
 
 def _apply_change(project_path: Path, change, ui: TarangConsole) -> bool:
