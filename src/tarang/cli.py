@@ -438,19 +438,21 @@ async def _run_stream_session(
     from tarang.stream import TarangStreamClient, EventType, FileChange
     from tarang.ui.keyboard import KeyboardMonitor, KeyAction, create_keyboard_hints
 
-    # Create stream client with project root for local tool execution
+    # Create keyboard monitor first (needed for callbacks)
+    keyboard = KeyboardMonitor(
+        console=ui.console,
+        on_status=lambda msg: ui.console.print(msg)
+    )
+
+    # Create stream client with keyboard callbacks for clean prompts
     client = TarangStreamClient(
         base_url=creds.get("backend_url"),
         token=creds.get("token"),
         openrouter_key=creds.get("openrouter_key"),
         project_root=str(project_path),
         verbose=verbose,
-    )
-
-    # Create keyboard monitor
-    keyboard = KeyboardMonitor(
-        console=ui.console,
-        on_status=lambda msg: ui.console.print(msg)
+        on_input_start=keyboard.stop,   # Pause keyboard monitor
+        on_input_end=keyboard.start,    # Resume keyboard monitor
     )
 
     # Print instructions with matching colors
@@ -591,27 +593,22 @@ async def _run_stream_session(
 
                 elif event.type == EventType.CONTENT:
                     # Text response (for queries)
-                    content = event.data.get("text", "")
+                    # Handle structured response: {operation, payload, human_readable_summary}
+                    data = event.data
 
-                    # Extract human_readable_summary if content is a dict
-                    if isinstance(content, dict):
+                    # Extract the actual message content
+                    if isinstance(data, dict):
                         content = (
-                            content.get("human_readable_summary") or
-                            content.get("payload", {}).get("message") or
-                            str(content)
+                            data.get("human_readable_summary") or
+                            data.get("text") or
+                            data.get("payload", {}).get("message") or
+                            data.get("message") or
+                            str(data)
                         )
-                    elif isinstance(content, str) and content.startswith("{"):
-                        # Try to parse JSON string
-                        try:
-                            import json
-                            parsed = json.loads(content.replace("'", '"'))
-                            content = (
-                                parsed.get("human_readable_summary") or
-                                parsed.get("payload", {}).get("message") or
-                                content
-                            )
-                        except (json.JSONDecodeError, ValueError):
-                            pass
+                    elif isinstance(data, str):
+                        content = data
+                    else:
+                        content = str(data)
 
                     ui.print_message(content, title="Answer")
 
@@ -703,9 +700,50 @@ def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bo
             ui.print_error(f"Login failed: {e}")
         return True
 
+    if cmd == "/config":
+        from tarang.client import TarangAuth
+        from tarang.stream import TarangStreamClient
+        auth = TarangAuth()
+        creds = auth.load_credentials() or {}
+
+        default_backend = TarangStreamClient.DEFAULT_BASE_URL
+
+        # Show current status
+        ui.console.print("\n[bold]Configuration[/]")
+        token_status = "[green]✓[/]" if creds.get("token") else "[red]✗[/]"
+        key_status = "[green]✓[/]" if creds.get("openrouter_key") else "[red]✗[/]"
+        backend_display = creds.get("backend_url") or f"{default_backend} [dim](default)[/dim]"
+        ui.console.print(f"  Login:      {token_status}")
+        ui.console.print(f"  API Key:    {key_status}")
+        ui.console.print(f"  Backend:    {backend_display}")
+
+        # Prompt for OpenRouter key
+        ui.console.print()
+        current_key = "(keep current)" if creds.get("openrouter_key") else ""
+        key = Prompt.ask("[cyan]OpenRouter API key[/]", default=current_key, password=True)
+        if key and key != "(keep current)":
+            auth.save_openrouter_key(key.strip())
+            ui.print_success("API key saved!")
+
+        # Prompt for backend URL
+        current_backend = creds.get("backend_url") or default_backend
+        backend = Prompt.ask("[cyan]Backend URL[/]", default=current_backend)
+        if backend and backend != current_backend:
+            if backend == default_backend:
+                # Reset to default - remove from config
+                auth.save_credentials(backend_url=None)
+                ui.print_success("Backend reset to default")
+            else:
+                auth.save_credentials(backend_url=backend.strip().rstrip("/"))
+                ui.print_success(f"Backend set to: {backend}")
+
+        return True
+
     if cmd in ("/exit", "/quit", "/q"):
-        ui.print_goodbye()
-        sys.exit(0)
+        if ui.confirm("Exit Tarang?", default=True):
+            ui.print_goodbye()
+            sys.exit(0)
+        return True
 
     return False
 

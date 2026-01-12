@@ -857,6 +857,8 @@ class TarangStreamClient:
         timeout: float = 300.0,  # 5 minutes for long operations
         on_tool_execute: Optional[Callable[[str, dict], dict]] = None,
         verbose: bool = False,
+        on_input_start: Optional[Callable[[], None]] = None,
+        on_input_end: Optional[Callable[[], None]] = None,
     ):
         self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
         self.token = token
@@ -865,6 +867,10 @@ class TarangStreamClient:
         self.timeout = timeout
         self.verbose = verbose
         self.current_task_id: Optional[str] = None
+
+        # Callbacks for pausing keyboard monitor during prompts
+        self._on_input_start = on_input_start or (lambda: None)
+        self._on_input_end = on_input_end or (lambda: None)
 
         # Cancellation flag - checked by execute loop
         self._cancelled = False
@@ -1051,7 +1057,8 @@ class TarangStreamClient:
             if self._approve_all or tool in self._approved_tools:
                 self.formatter.show_approval_status("auto_approved")
             else:
-                # Ask for user approval
+                # Pause keyboard monitor for clean input
+                self._on_input_start()
                 try:
                     response = self.formatter.show_approval_prompt(tool, args)
 
@@ -1086,6 +1093,9 @@ class TarangStreamClient:
                 except (EOFError, KeyboardInterrupt):
                     self.formatter.show_approval_status("cancelled")
                     return
+                finally:
+                    # Resume keyboard monitor
+                    self._on_input_end()
 
         # Execute tool locally
         result = self._execute_tool(tool, args)

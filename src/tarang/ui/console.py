@@ -77,6 +77,8 @@ class TarangConsole:
         help_text = """
 [bold]Commands:[/]
   [cyan]/help[/]      Show this help message
+  [cyan]/login[/]     Login to Tarang
+  [cyan]/config[/]    Configure API key
   [cyan]/git[/]       Show git status
   [cyan]/files[/]     List tracked files
   [cyan]/add[/]       Add files to context
