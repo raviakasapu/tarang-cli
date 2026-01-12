@@ -468,7 +468,7 @@ async def _run_stream_session(
 
                 # Handle slash commands
                 if instruction.startswith("/"):
-                    if _handle_slash_command(ui, instruction, project_path):
+                    if await _handle_slash_command(ui, instruction, project_path):
                         instruction = None
                         continue
 
@@ -645,7 +645,7 @@ async def _run_stream_session(
             instruction = None
 
 
-def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bool:
+async def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bool:
     """Handle slash commands. Returns True if handled."""
     cmd = cmd.lower().strip()
 
@@ -678,7 +678,7 @@ def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bo
                 return True
         ui.print_info("Starting authentication...")
         try:
-            asyncio.run(auth.login())
+            await auth.login()
             ui.print_success("Login successful!")
         except Exception as e:
             ui.print_error(f"Login failed: {e}")
@@ -690,13 +690,12 @@ def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bo
         auth = TarangAuth()
         creds = auth.load_credentials() or {}
 
-        default_backend = TarangStreamClient.DEFAULT_BASE_URL
-
         # Show current status
         ui.console.print("\n[bold]Configuration[/]")
         token_status = "[green]✓[/]" if creds.get("token") else "[red]✗[/]"
         key_status = "[green]✓[/]" if creds.get("openrouter_key") else "[red]✗[/]"
-        backend_display = creds.get("backend_url") or f"{default_backend} [dim](default)[/dim]"
+        custom_backend = creds.get("backend_url")
+        backend_display = custom_backend or "[dim](default)[/dim]"
         ui.console.print(f"  Login:      {token_status}")
         ui.console.print(f"  API Key:    {key_status}")
         ui.console.print(f"  Backend:    {backend_display}")
@@ -710,16 +709,17 @@ def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bo
             ui.print_success("API key saved!")
 
         # Prompt for backend URL
-        current_backend = creds.get("backend_url") or default_backend
-        backend = Prompt.ask("[cyan]Backend URL[/]", default=current_backend)
-        if backend and backend != current_backend:
-            if backend == default_backend:
+        ui.console.print("[dim]Leave empty or type 'default' to use default backend[/dim]")
+        current_display = custom_backend or "(default)"
+        backend = Prompt.ask("[cyan]Backend URL[/]", default=current_display)
+        if backend in ("", "(default)", "default"):
+            if custom_backend:
                 # Reset to default - remove from config
                 auth.save_credentials(backend_url=None)
                 ui.print_success("Backend reset to default")
-            else:
-                auth.save_credentials(backend_url=backend.strip().rstrip("/"))
-                ui.print_success(f"Backend set to: {backend}")
+        elif backend != current_display:
+            auth.save_credentials(backend_url=backend.strip().rstrip("/"))
+            ui.print_success(f"Backend set to: {backend}")
 
         return True
 
