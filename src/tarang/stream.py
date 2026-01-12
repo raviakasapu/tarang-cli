@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -120,8 +121,16 @@ class LocalToolExecutor:
         ".DS_Store", "Thumbs.db",
     }
 
-    def __init__(self, project_root: str):
+    def __init__(
+        self,
+        project_root: str,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+        set_process: Optional[Callable[[subprocess.Popen], None]] = None,
+    ):
         self.project_root = Path(project_root).resolve()
+        # Optional callbacks for shell interruption
+        self._is_cancelled = is_cancelled or (lambda: False)
+        self._set_process = set_process or (lambda p: None)
 
     def execute(self, tool: str, args: dict) -> dict:
         """Execute a tool and return the result."""
@@ -466,7 +475,7 @@ class LocalToolExecutor:
             return {"error": str(e), "success": False}
 
     def _shell(self, args: dict) -> dict:
-        """Execute a shell command."""
+        """Execute a shell command with interruptibility support."""
         command = args.get("command", "")
         cwd = args.get("cwd") or "."
         timeout = args.get("timeout", 60)
@@ -477,21 +486,68 @@ class LocalToolExecutor:
         working_dir = self.project_root / cwd
 
         try:
-            result = subprocess.run(
+            # Use Popen for interruptibility
+            process = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=working_dir,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
             )
+
+            # Register process for potential cancellation
+            self._set_process(process)
+
+            # Poll with timeout, checking cancellation
+            stdout_parts = []
+            stderr_parts = []
+            start_time = time.time()
+
+            while True:
+                # Check if cancelled
+                if self._is_cancelled():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return {"error": "Cancelled by user", "exit_code": -1, "cancelled": True}
+
+                # Check if process finished
+                retcode = process.poll()
+                if retcode is not None:
+                    # Process finished - read remaining output
+                    stdout, stderr = process.communicate()
+                    stdout_parts.append(stdout)
+                    stderr_parts.append(stderr)
+                    break
+
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return {"error": f"Command timed out after {timeout}s", "exit_code": -1}
+
+                # Wait a bit before next poll
+                time.sleep(0.1)
+
+            # Clear process reference
+            self._set_process(None)
+
+            stdout_full = "".join(stdout_parts)
+            stderr_full = "".join(stderr_parts)
+
             return {
-                "exit_code": result.returncode,
-                "stdout": result.stdout[:5000] if result.stdout else "",
-                "stderr": result.stderr[:2000] if result.stderr else "",
+                "exit_code": retcode,
+                "stdout": stdout_full[:5000] if stdout_full else "",
+                "stderr": stderr_full[:2000] if stderr_full else "",
             }
-        except subprocess.TimeoutExpired:
-            return {"error": f"Command timed out after {timeout}s", "exit_code": -1}
+
         except Exception as e:
             return {"error": str(e), "exit_code": -1}
 
@@ -810,6 +866,11 @@ class TarangStreamClient:
         self.verbose = verbose
         self.current_task_id: Optional[str] = None
 
+        # Cancellation flag - checked by execute loop
+        self._cancelled = False
+        # Current shell process - can be interrupted
+        self._shell_process: Optional[subprocess.Popen] = None
+
         # Rich output formatter for consistent display
         self.console = Console()
         self.formatter = OutputFormatter(self.console, verbose=verbose)
@@ -822,8 +883,16 @@ class TarangStreamClient:
         if on_tool_execute:
             self._execute_tool = on_tool_execute
         else:
-            self._tool_executor = LocalToolExecutor(self.project_root)
+            self._tool_executor = LocalToolExecutor(
+                self.project_root,
+                is_cancelled=lambda: self._cancelled,
+                set_process=self._set_shell_process,
+            )
             self._execute_tool = self._tool_executor.execute
+
+    def _set_shell_process(self, process: Optional[subprocess.Popen]):
+        """Track current shell process for potential cancellation."""
+        self._shell_process = process
 
     async def execute(
         self,
@@ -842,6 +911,9 @@ class TarangStreamClient:
         Yields:
             StreamEvent objects
         """
+        # Reset cancellation flag for new execution
+        self._cancelled = False
+
         if not self.token:
             yield StreamEvent(
                 type=EventType.ERROR,
@@ -903,6 +975,14 @@ class TarangStreamClient:
                     current_data = []
 
                     async for line in response.aiter_lines():
+                        # Check cancellation flag
+                        if self._cancelled:
+                            yield StreamEvent(
+                                type=EventType.STATUS,
+                                data={"message": "Cancelled", "cancelled": True},
+                            )
+                            return
+
                         line = line.strip()
 
                         if not line:
@@ -1041,9 +1121,25 @@ class TarangStreamClient:
             self.formatter.show_callback_status(False, str(e))
 
     async def cancel(self) -> bool:
-        """Cancel the current task."""
+        """Cancel the current task immediately."""
+        # Set cancellation flag first - this breaks the execute loop
+        self._cancelled = True
+
+        # Kill any running shell process
+        if self._shell_process and self._shell_process.poll() is None:
+            try:
+                self._shell_process.terminate()
+                self._shell_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self._shell_process.kill()
+                except Exception:
+                    pass
+            self._shell_process = None
+
+        # Notify backend
         if not self.current_task_id:
-            return False
+            return True
 
         url = f"{self.base_url}/v2/v3/cancel/{self.current_task_id}"
 
@@ -1056,7 +1152,7 @@ class TarangStreamClient:
                 return resp.status_code == 200
             except Exception as e:
                 logger.error(f"Cancel error: {e}")
-                return False
+                return True  # Still return True since we set the flag
 
 
 # Backward compatibility alias
