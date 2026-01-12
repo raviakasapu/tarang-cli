@@ -623,7 +623,9 @@ async def _run_stream_session(
                     if verbose:
                         ui.console.print("[dim]✓ Complete[/dim]")
 
-            # Apply changes
+            # Apply changes - stop keyboard monitor for clean prompts
+            keyboard.stop()
+
             if changes_to_apply:
                 ui.console.print(f"\n[bold]Ready to apply {len(changes_to_apply)} change(s)[/bold]")
 
