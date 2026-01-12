@@ -22,21 +22,8 @@ from rich.layout import Layout
 class TarangConsole:
     """Rich console for Tarang CLI with Aider-like UI."""
 
-    BANNER = """
-[bold green]██████╗  ███████╗ ██╗   ██╗[/]
-[bold green]██╔══██╗ ██╔════╝ ██║   ██║[/]
-[bold green]██║  ██║ █████╗   ██║   ██║[/]
-[bold green]██║  ██║ ██╔══╝   ╚██╗ ██╔╝[/]
-[bold green]██████╔╝ ███████╗  ╚████╔╝ [/]
-[bold green]╚═════╝  ╚══════╝   ╚═══╝  [/]
-
-[bold cyan]████████╗  █████╗  ██████╗   █████╗  ███╗   ██╗  ██████╗ [/]
-[bold cyan]╚══██╔══╝ ██╔══██╗ ██╔══██╗ ██╔══██╗ ████╗  ██║ ██╔════╝ [/]
-[bold cyan]   ██║    ███████║ ██████╔╝ ███████║ ██╔██╗ ██║ ██║  ███╗[/]
-[bold cyan]   ██║    ██╔══██║ ██╔══██╗ ██╔══██║ ██║╚██╗██║ ██║   ██║[/]
-[bold cyan]   ██║    ██║  ██║ ██║  ██║ ██║  ██║ ██║ ╚████║ ╚██████╔╝[/]
-[bold cyan]   ╚═╝    ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═══╝  ╚═════╝ [/]
-"""
+    # Compact banner with DEV (green) + TARANG (cyan)
+    BANNER = """[bold green]DEV[/] [bold cyan]TARANG[/] [dim]AI Coding Agent[/]"""
 
     def __init__(self, verbose: bool = False):
         self.console = Console()
@@ -46,15 +33,23 @@ class TarangConsole:
     def print_banner(self, version: str, project_path: Path):
         """Print the startup banner with project info."""
         self.project_path = project_path
-        self.console.print(self.BANNER)
 
-        # Project info bar
+        # Compact header: DEV TARANG v0.0.0 | project | git
         git_info = self._get_git_info(project_path)
-        info_text = f"[dim]v{version}[/] │ [bold]{project_path.name}[/]"
-        if git_info:
-            info_text += f" │ [yellow]{git_info}[/]"
+        header = f"{self.BANNER} [dim]v{version}[/]"
+        self.console.print(header)
 
-        self.console.print(Panel(info_text, style="blue", padding=(0, 1)))
+        # Project info
+        project_info = f"[bold]{project_path.name}[/]"
+        if git_info:
+            project_info += f" [dim]│[/] [yellow]{git_info}[/]"
+        self.console.print(project_info)
+        self.console.print()
+
+    def print_instructions(self):
+        """Print usage instructions with matching colors."""
+        self.console.print("[green]Type your instructions[/], or [cyan]/help[/] for commands")
+        self.console.print("[dim]ESC[/][green]=[/][dim]cancel[/]  [dim]SPACE[/][cyan]=[/][dim]add instruction[/]")
         self.console.print()
 
     def print_project_stats(self, total_files: int, total_lines: int):

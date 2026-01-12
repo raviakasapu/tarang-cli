@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional, List, Dict
 
 import click
+from rich.prompt import Prompt
 
 from tarang import __version__
 from tarang.client import TarangAPIClient, TarangAuth
@@ -182,15 +183,30 @@ def run(ctx, instruction: str, project_dir: str, verbose: bool, yes: bool):
     ui = get_console(verbose)
     auth = TarangAuth()
 
-    # Check authentication
+    # Check authentication - prompt to login if needed
     if not auth.is_authenticated():
-        ui.print_error("Not logged in. Run 'tarang login' first.", recoverable=False)
-        sys.exit(1)
+        ui.console.print("[yellow]Not logged in.[/]")
+        if ui.confirm("Login now?", default=True):
+            try:
+                asyncio.run(auth.login())
+                ui.print_success("Login successful!")
+            except Exception as e:
+                ui.print_error(f"Login failed: {e}", recoverable=False)
+                sys.exit(1)
+        else:
+            ui.print_info("Run [cyan]/login[/] when ready.")
+            sys.exit(0)
 
+    # Check OpenRouter key - prompt to set if needed
     if not auth.has_openrouter_key():
-        ui.print_error("OpenRouter key not set.", recoverable=False)
-        ui.console.print("Run: [cyan]tarang config --openrouter-key YOUR_KEY[/]")
-        sys.exit(1)
+        ui.console.print("[yellow]OpenRouter API key not set.[/]")
+        key = Prompt.ask("[cyan]Enter your OpenRouter API key[/]", password=True)
+        if key and key.strip():
+            auth.save_openrouter_key(key.strip())
+            ui.print_success("API key saved!")
+        else:
+            ui.print_info("Run [cyan]tarang config --openrouter-key YOUR_KEY[/] to set later.")
+            sys.exit(0)
 
     # Resolve project directory
     project_path = Path(project_dir).resolve()
@@ -437,8 +453,8 @@ async def _run_stream_session(
         on_status=lambda msg: ui.console.print(msg)
     )
 
-    ui.console.print("[dim]Type your instructions, or /help for commands[/dim]")
-    ui.console.print(f"[dim]{create_keyboard_hints()}[/dim]\n")
+    # Print instructions with matching colors
+    ui.print_instructions()
 
     while True:
         # Get instruction from user
@@ -576,6 +592,27 @@ async def _run_stream_session(
                 elif event.type == EventType.CONTENT:
                     # Text response (for queries)
                     content = event.data.get("text", "")
+
+                    # Extract human_readable_summary if content is a dict
+                    if isinstance(content, dict):
+                        content = (
+                            content.get("human_readable_summary") or
+                            content.get("payload", {}).get("message") or
+                            str(content)
+                        )
+                    elif isinstance(content, str) and content.startswith("{"):
+                        # Try to parse JSON string
+                        try:
+                            import json
+                            parsed = json.loads(content.replace("'", '"'))
+                            content = (
+                                parsed.get("human_readable_summary") or
+                                parsed.get("payload", {}).get("message") or
+                                content
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
                     ui.print_message(content, title="Answer")
 
                 elif event.type == EventType.ERROR:
@@ -647,6 +684,21 @@ def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bo
 
     if cmd == "/clear":
         ui.console.print("[green]Ready for new instructions[/green]")
+        return True
+
+    if cmd == "/login":
+        from tarang.client import TarangAuth
+        auth = TarangAuth()
+        if auth.is_authenticated():
+            ui.print_info("Already logged in.")
+            if not ui.confirm("Login again?", default=False):
+                return True
+        ui.print_info("Starting authentication...")
+        try:
+            asyncio.run(auth.login())
+            ui.print_success("Login successful!")
+        except Exception as e:
+            ui.print_error(f"Login failed: {e}")
         return True
 
     if cmd in ("/exit", "/quit", "/q"):
