@@ -2,11 +2,11 @@
 SSE Stream Client with REST Callbacks - Industry-standard pattern.
 
 This implements the SSE + REST callback pattern used by OpenAI, Anthropic, Cursor:
-1. CLI sends POST /v3/execute with instruction + initial context
+1. CLI sends POST /api/execute with instruction + initial context
 2. Backend streams SSE events (status, tool_request, plan, change, etc.)
 3. When backend needs a tool result, it sends tool_request and WAITS
 4. CLI executes the tool locally
-5. CLI sends POST /v3/callback with the result
+5. CLI sends POST /api/callback with the result
 6. Backend continues the stream
 
 Benefits:
@@ -934,7 +934,7 @@ class TarangStreamClient:
             )
             return
 
-        url = f"{self.base_url}/v2/v3/execute"
+        url = f"{self.base_url}/api/execute"
 
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -1079,7 +1079,7 @@ class TarangStreamClient:
                         result = {"skipped": True, "message": "User rejected operation"}
                         self.formatter.show_approval_status("skipped")
                         # Send skipped result
-                        callback_url = f"{self.base_url}/v2/v3/callback"
+                        callback_url = f"{self.base_url}/api/callback"
                         callback_body = {
                             "task_id": self.current_task_id,
                             "call_id": call_id,
@@ -1105,7 +1105,7 @@ class TarangStreamClient:
         logger.info(f"[LOCAL] Tool result: {result.get('success', 'completed')}")
 
         # Send result via callback
-        callback_url = f"{self.base_url}/v2/v3/callback"
+        callback_url = f"{self.base_url}/api/callback"
         callback_body = {
             "task_id": self.current_task_id,
             "call_id": call_id,
@@ -1151,7 +1151,7 @@ class TarangStreamClient:
         if not self.current_task_id:
             return True
 
-        url = f"{self.base_url}/v2/v3/cancel/{self.current_task_id}"
+        url = f"{self.base_url}/api/cancel/{self.current_task_id}"
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:

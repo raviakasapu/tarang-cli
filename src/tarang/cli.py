@@ -424,9 +424,9 @@ async def _run_stream_session(
 
     Flow:
     1. Collect local context (file list, relevant files)
-    2. Send POST /v3/execute with instruction + context
+    2. Send POST /api/execute with instruction + context
     3. Backend streams SSE events (status, tool_request, plan, change, etc.)
-    4. When tool_request received, execute tool locally and POST /v3/callback
+    4. When tool_request received, execute tool locally and POST /api/callback
     5. Backend continues streaming after receiving callback
     6. Apply file changes locally when complete
 
@@ -454,6 +454,10 @@ async def _run_stream_session(
         on_input_start=keyboard.stop,   # Pause keyboard monitor
         on_input_end=keyboard.start,    # Resume keyboard monitor
     )
+
+    # Debug: Show backend URL
+    if verbose:
+        ui.console.print(f"[dim]Backend: {client.base_url}[/dim]")
 
     # Print instructions with matching colors
     ui.print_instructions()
