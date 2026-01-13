@@ -33,6 +33,7 @@ import httpx
 from rich.console import Console
 
 from tarang.context_collector import ProjectContext
+from tarang.context.retriever import get_retriever
 from tarang.ui.formatter import OutputFormatter
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,12 @@ class EventType(str, Enum):
     TOOL_REQUEST = "tool_request"  # Legacy name
     TOOL_CALL = "tool_call"  # New name (SSE Split Architecture)
     TOOL_DONE = "tool_done"
-    THINKING = "thinking"  # New: agent thinking
-    PLAN = "plan"
+    THINKING = "thinking"  # Agent thinking/reasoning
+    PLAN = "plan"  # Strategic plan from orchestrator
+    PHASE_START = "phase_start"  # Phase beginning
+    WORKER_START = "worker_start"  # Worker beginning
+    WORKER_DONE = "worker_done"  # Worker completed
+    DELEGATION = "delegation"  # Agent delegation
     CHANGE = "change"
     CONTENT = "content"
     ERROR = "error"
@@ -142,6 +147,8 @@ class LocalToolExecutor:
                 return self._read_file(args)
             elif tool == "search_files":
                 return self._search_files(args)
+            elif tool == "search_code":
+                return self._search_code(args)
             elif tool == "get_file_info":
                 return self._get_file_info(args)
             # Write tools (require approval - handled by caller)
@@ -341,6 +348,49 @@ class LocalToolExecutor:
                     continue
 
         return {"matches": matches, "count": len(matches)}
+
+    def _search_code(self, args: dict) -> dict:
+        """Search codebase using BM25 + Knowledge Graph retriever."""
+        query = args.get("query", "")
+        hops = args.get("hops", 1)
+        max_chunks = args.get("max_chunks", 10)
+
+        if not query:
+            return {"error": "query required"}
+
+        try:
+            retriever = get_retriever(self.project_root)
+            if retriever is None:
+                return {
+                    "error": "Index not found. Run '/index' to create the code index.",
+                    "indexed": False,
+                }
+
+            result = retriever.retrieve(query=query, hops=hops, max_chunks=max_chunks)
+
+            # Format chunks for response
+            chunks = []
+            for chunk in result.get("chunks", []):
+                chunks.append({
+                    "id": chunk.get("id", ""),
+                    "file": chunk.get("file", ""),
+                    "name": chunk.get("name", ""),
+                    "type": chunk.get("type", ""),
+                    "content": chunk.get("content", "")[:2000],  # Limit content size
+                    "line_start": chunk.get("line_start", 0),
+                    "signature": chunk.get("signature", ""),
+                })
+
+            return {
+                "success": True,
+                "chunks": chunks,
+                "signatures": result.get("signatures", []),
+                "graph": result.get("graph", {}),
+                "indexed": True,
+            }
+        except Exception as e:
+            logger.exception("search_code error")
+            return {"error": f"Search failed: {e}", "indexed": True}
 
     def _get_file_info(self, args: dict) -> dict:
         """Get metadata about a file."""

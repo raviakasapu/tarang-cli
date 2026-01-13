@@ -558,6 +558,144 @@ class OutputFormatter:
             display += f": {message}"
         self.console.print(f"[cyan]{display}[/cyan]")
 
+    # =========================================================================
+    # Orchestrator Phase & Task Tracking
+    # =========================================================================
+
+    def show_strategic_plan(self, plan: Dict[str, Any]) -> None:
+        """
+        Display the orchestrator's strategic plan with PRD and phases.
+
+        Args:
+            plan: Plan dict containing 'prd' and 'phases'
+        """
+        prd = plan.get("prd", {})
+        phases = plan.get("phases", [])
+
+        # PRD Header
+        if prd:
+            title = prd.get("title", "Project")
+            self.console.print()
+            self.console.print(f"[bold blue]╭─────────────────────────────────────────────────────╮[/bold blue]")
+            self.console.print(f"[bold blue]│[/bold blue]  📋 [bold]{title}[/bold]")
+            self.console.print(f"[bold blue]╰─────────────────────────────────────────────────────╯[/bold blue]")
+
+            # Requirements
+            requirements = prd.get("requirements", [])
+            if requirements:
+                self.console.print(f"  [dim]Requirements:[/dim]")
+                for req in requirements[:5]:
+                    self.console.print(f"    [dim]• {req[:60]}{'...' if len(req) > 60 else ''}[/dim]")
+
+        # Phases overview
+        if phases:
+            self.console.print()
+            self.console.print(f"[bold cyan]  📊 Execution Plan ({len(phases)} phases):[/bold cyan]")
+
+            for i, phase in enumerate(phases, 1):
+                name = phase.get("name", f"Phase {i}")
+                worker = phase.get("worker", "architect")
+                goals = phase.get("goals", "")[:50]
+
+                # Phase status indicator
+                status_icon = "○"  # pending
+                color = "dim"
+
+                self.console.print(f"    [{color}]{status_icon} {name}[/{color}]")
+                if goals:
+                    self.console.print(f"      [{color}]→ {worker}: {goals}{'...' if len(phase.get('goals', '')) > 50 else ''}[/{color}]")
+
+            self.console.print()
+
+    def show_phase_start(self, phase_name: str, phase_index: int = 0, total_phases: int = 0) -> None:
+        """
+        Display when a phase starts executing.
+
+        Args:
+            phase_name: Name of the phase
+            phase_index: Current phase number (1-based)
+            total_phases: Total number of phases
+        """
+        progress = f"[{phase_index}/{total_phases}]" if total_phases > 0 else ""
+        self.console.print()
+        self.console.print(f"[bold cyan]▶ {progress} {phase_name}[/bold cyan]")
+        self.console.print(f"[cyan]{'─' * 50}[/cyan]")
+
+    def show_worker_start(self, worker: str, task: str = "") -> None:
+        """
+        Display when a worker starts.
+
+        Args:
+            worker: Worker name (e.g., "architect", "explorer", "coder")
+            task: Task description
+        """
+        worker_icons = {
+            "orchestrator": "🎯",
+            "architect": "📐",
+            "explorer": "🔍",
+            "coder": "💻",
+        }
+        icon = worker_icons.get(worker.lower(), "•")
+        self.console.print(f"  [yellow]{icon} {worker}[/yellow]", end="")
+        if task:
+            # Truncate long tasks
+            display_task = task[:60] + "..." if len(task) > 60 else task
+            self.console.print(f" [dim]→ {display_task}[/dim]")
+        else:
+            self.console.print()
+
+    def show_worker_done(self, worker: str, success: bool = True) -> None:
+        """
+        Display when a worker completes.
+
+        Args:
+            worker: Worker name
+            success: Whether it completed successfully
+        """
+        if success:
+            self.console.print(f"  [green]✓ {worker} done[/green]")
+        else:
+            self.console.print(f"  [red]✗ {worker} failed[/red]")
+
+    def show_task_decomposition(self, tasks: list) -> None:
+        """
+        Display architect's task decomposition.
+
+        Args:
+            tasks: List of tasks from architect
+        """
+        if not tasks:
+            return
+
+        self.console.print()
+        self.console.print(f"  [bold magenta]📋 Task Breakdown ({len(tasks)} tasks):[/bold magenta]")
+
+        for i, task in enumerate(tasks, 1):
+            if isinstance(task, dict):
+                worker = task.get("worker", "coder")
+                goals = task.get("goals", "")[:55]
+                worker_icon = "🔍" if worker == "explorer" else "💻"
+                self.console.print(f"    [dim]{i}. {worker_icon} {worker}:[/dim] {goals}{'...' if len(task.get('goals', '')) > 55 else ''}")
+            else:
+                self.console.print(f"    [dim]{i}. {str(task)[:60]}[/dim]")
+        self.console.print()
+
+    def show_delegation(self, from_agent: str, to_agent: str, task: str = "") -> None:
+        """
+        Display delegation between agents.
+
+        Args:
+            from_agent: Delegating agent
+            to_agent: Target agent
+            task: Task being delegated
+        """
+        self.console.print(f"  [dim]↳ {from_agent} → {to_agent}[/dim]", end="")
+        if task:
+            display_task = task[:40] + "..." if len(task) > 40 else task
+            self.console.print(f" [dim italic]({display_task})[/dim italic]")
+        else:
+            self.console.print()
+
     def show_thinking(self, message: str) -> None:
         """Show thinking/reasoning indicator."""
         self.console.print(f"  [dim cyan]💭 {message}[/dim cyan]")

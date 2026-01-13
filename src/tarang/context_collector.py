@@ -34,10 +34,11 @@ class ProjectContext:
     cwd: str
     files: List[str] = field(default_factory=list)
     relevant_files: List[FileContent] = field(default_factory=list)
+    _indexed_context: Optional[dict] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for API."""
-        return {
+        result = {
             "cwd": self.cwd,
             "files": self.files,
             "relevant_files": [
@@ -45,6 +46,12 @@ class ProjectContext:
                 for f in self.relevant_files
             ],
         }
+
+        # Include indexed context if available (BM25 + KG retrieval)
+        if self._indexed_context:
+            result["indexed"] = self._indexed_context
+
+        return result
 
 
 class ContextCollector:

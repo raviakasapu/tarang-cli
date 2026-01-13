@@ -79,6 +79,7 @@ class TarangConsole:
   [cyan]/help[/]      Show this help message
   [cyan]/login[/]     Login to Tarang
   [cyan]/config[/]    Configure API key
+  [cyan]/index[/]     Build code index for better context
   [cyan]/git[/]       Show git status
   [cyan]/files[/]     List tracked files
   [cyan]/add[/]       Add files to context
@@ -90,6 +91,7 @@ class TarangConsole:
   [cyan]/exit[/]      Exit Tarang
 
 [bold]Tips:[/]
+  • Run [cyan]/index[/] to enable smart code retrieval
   • Type your request naturally: "add a login button"
   • Reference files: "fix the bug in src/main.py"
   • Ask questions: "explain how auth works"

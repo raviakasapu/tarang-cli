@@ -434,7 +434,8 @@ async def _run_stream_session(
     - ESC: Cancel current execution
     - SPACE: Pause and add extra instruction
     """
-    from tarang.context_collector import collect_context
+    from tarang.context_collector import collect_context, ProjectContext
+    from tarang.context import get_retriever
     from tarang.stream import TarangStreamClient, EventType, FileChange
     from tarang.ui.keyboard import KeyboardMonitor, KeyAction, create_keyboard_hints
 
@@ -487,9 +488,28 @@ async def _run_stream_session(
 
         # Collect local context (for initial context in request)
         ui.console.print("[dim]Collecting context...[/dim]")
-        context = collect_context(str(project_path), instruction)
-        if verbose:
-            ui.console.print(f"[dim]Found {len(context.files)} files, {len(context.relevant_files)} relevant[/dim]")
+
+        # Try indexed retrieval first (BM25 + KG)
+        retriever = get_retriever(project_path)
+        if retriever and retriever.is_ready:
+            # Use smart retrieval
+            result = retriever.retrieve(instruction, hops=1, max_chunks=10)
+            context = ProjectContext(
+                cwd=str(project_path),
+                files=[],  # Will be populated below
+                relevant_files=[],  # Not used with indexed retrieval
+            )
+            # Attach indexed context to be sent to backend
+            context._indexed_context = result.to_context_dict()
+            if verbose:
+                stats = result.stats
+                ui.console.print(f"[dim]Retrieved {stats.get('total_chunks', 0)} chunks, {stats.get('expanded_symbols', 0)} connected symbols[/dim]")
+        else:
+            # Fall back to old context collection
+            context = collect_context(str(project_path), instruction)
+            if verbose:
+                ui.console.print(f"[dim]Found {len(context.files)} files, {len(context.relevant_files)} relevant[/dim]")
+                ui.console.print("[dim]Tip: Run /index for smarter context retrieval[/dim]")
 
         # Stream execution with tool callbacks
         ui.console.print()
@@ -527,48 +547,77 @@ async def _run_stream_session(
                 if event.type == EventType.STATUS:
                     msg = event.data.get("message", "Working...")
                     phase = event.data.get("phase", "")
+                    worker = event.data.get("worker", "")
+                    delegation = event.data.get("delegation", "")
+                    task = event.data.get("task", "")
 
-                    # Show phase transitions
-                    if phase and phase != current_phase:
+                    # Worker start/done events
+                    if worker:
+                        if "completed" in msg.lower() or "done" in msg.lower():
+                            client.formatter.show_worker_done(worker, success=True)
+                        else:
+                            client.formatter.show_worker_start(worker, task)
+                    # Delegation events
+                    elif delegation:
+                        client.formatter.show_delegation("agent", delegation, task)
+                    # Phase transitions
+                    elif phase and phase != current_phase:
                         current_phase = phase
-                        phase_icons = {"explore": "🔍", "plan": "📋", "implement": "⚡", "generate": "✨"}
-                        icon = phase_icons.get(phase, "•")
-                        ui.console.print(f"[cyan]{icon} {phase.title()}[/cyan]")
-
-                    if verbose:
+                        client.formatter.show_phase_start(phase)
+                    elif verbose:
                         ui.console.print(f"[dim]{msg}[/dim]")
 
                 elif event.type == EventType.THINKING:
                     # Agent thinking/reasoning
                     msg = event.data.get("message", "Thinking...")
-                    iteration = event.data.get("iteration", 0)
-                    if verbose:
-                        ui.console.print(f"[dim cyan]💭 {msg}[/dim cyan]")
+                    # Extract worker name if present (e.g., "[explorer] Using read_file...")
+                    if msg.startswith("[") and "]" in msg:
+                        worker_end = msg.index("]")
+                        worker_name = msg[1:worker_end]
+                        action = msg[worker_end + 2:]
+                        if verbose:
+                            ui.console.print(f"  [dim cyan]💭 {worker_name}: {action}[/dim cyan]")
+                        else:
+                            # Minimal indicator
+                            ui.console.print(f"  [dim]• {action[:60]}{'...' if len(action) > 60 else ''}[/dim]")
                     else:
-                        # Show minimal thinking indicator
-                        ui.console.print(f"[dim]• {msg}[/dim]")
+                        if verbose:
+                            ui.console.print(f"  [dim cyan]💭 {msg}[/dim cyan]")
 
                 elif event.type == EventType.TOOL_DONE:
                     # Tool execution completed (already handled internally)
                     tool = event.data.get("tool", "")
                     if verbose:
-                        ui.console.print(f"[dim]  ✓ {tool}[/dim]")
+                        ui.console.print(f"  [dim]  ✓ {tool}[/dim]")
 
                 elif event.type == EventType.PLAN:
-                    desc = event.data.get("description", "")
-                    steps = event.data.get("steps", [])
-                    files = event.data.get("files", [])
+                    # Strategic plan from orchestrator
+                    plan = event.data.get("plan", event.data)
+                    phases = event.data.get("phases", [])
 
-                    if desc:
-                        ui.console.print(f"\n[bold]Plan:[/bold] {desc}")
-                    if steps:
-                        ui.console.print("[dim]Steps:[/dim]")
-                        for i, step in enumerate(steps[:5], 1):
-                            ui.console.print(f"  {i}. {step}")
-                    if files:
-                        ui.console.print("[dim]Files to modify:[/dim]")
-                        for f in files[:10]:
-                            ui.console.print(f"  • {f}")
+                    # Use new formatter if we have phases
+                    if phases or plan.get("prd"):
+                        client.formatter.show_strategic_plan(plan)
+                    else:
+                        # Legacy format
+                        desc = event.data.get("description", "")
+                        steps = event.data.get("steps", [])
+                        files = event.data.get("files", [])
+
+                        if desc:
+                            ui.console.print(f"\n[bold]Plan:[/bold] {desc}")
+                        if steps:
+                            ui.console.print("[dim]Steps:[/dim]")
+                            for i, step in enumerate(steps[:5], 1):
+                                ui.console.print(f"  {i}. {step}")
+                        if files:
+                            ui.console.print("[dim]Files to modify:[/dim]")
+                            for f in files[:10]:
+                                ui.console.print(f"  • {f}")
+
+                    # Also show task decomposition if phases have tasks
+                    if phases:
+                        client.formatter.show_task_decomposition(phases)
 
                 elif event.type == EventType.CHANGE:
                     change = FileChange.from_dict(event.data)
@@ -724,6 +773,56 @@ async def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path)
         elif backend != current_display:
             auth.save_credentials(backend_url=backend.strip().rstrip("/"))
             ui.print_success(f"Backend set to: {backend}")
+
+        return True
+
+    if cmd.startswith("/index"):
+        # Parse flags
+        force = "--force" in cmd or "-f" in cmd
+        show_stats = "--stats" in cmd or "-s" in cmd
+
+        from tarang.context import ProjectIndexer
+
+        indexer = ProjectIndexer(project_path)
+
+        if show_stats:
+            stats = indexer.stats()
+            if not stats.get("indexed"):
+                ui.console.print("[yellow]Project not indexed.[/] Run [cyan]/index[/] to build index.")
+            else:
+                ui.console.print("\n[bold]Index Statistics[/]")
+                ui.console.print(f"  Files:      {stats['files']}")
+                ui.console.print(f"  Chunks:     {stats['chunks']}")
+                ui.console.print(f"  Symbols:    {stats['symbols']}")
+                ui.console.print(f"  Edges:      {stats['edges']}")
+                if stats.get("chunk_types"):
+                    ui.console.print(f"  Types:      {stats['chunk_types']}")
+            return True
+
+        # Build or update index
+        ui.console.print("[dim]Indexing project...[/dim]")
+
+        try:
+            result = indexer.build(force=force)
+
+            ui.console.print(f"  [green]✓[/] Scanned: {result.files_scanned} files")
+            ui.console.print(f"  [green]✓[/] Indexed: {result.files_indexed} files")
+            ui.console.print(f"  [green]✓[/] Chunks:  {result.chunks_created}")
+            ui.console.print(f"  [green]✓[/] Symbols: {result.symbols_created}")
+            ui.console.print(f"  [green]✓[/] Edges:   {result.edges_created}")
+            ui.console.print(f"  [dim]Duration: {result.duration_ms}ms[/dim]")
+
+            if result.errors:
+                ui.console.print(f"\n[yellow]Warnings ({len(result.errors)}):[/]")
+                for err in result.errors[:5]:
+                    ui.console.print(f"  [dim]{err}[/dim]")
+                if len(result.errors) > 5:
+                    ui.console.print(f"  [dim]... and {len(result.errors) - 5} more[/dim]")
+
+            ui.console.print("\n[green]Index built![/] Stored in [cyan].tarang/index/[/]")
+
+        except Exception as e:
+            ui.print_error(f"Indexing failed: {e}")
 
         return True
 

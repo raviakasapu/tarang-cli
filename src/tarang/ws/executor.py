@@ -60,6 +60,7 @@ class ToolExecutor:
             "delete_file": self._delete_file,
             "list_files": self._list_files,
             "search_files": self._search_files,
+            "search_code": self._search_code,
             "get_file_info": self._get_file_info,
             "create_directory": self._create_directory,
             "shell": self._shell,
@@ -142,6 +143,8 @@ class ToolExecutor:
             return f"List files: {args.get('path', '.')}"
         elif tool == "search_files":
             return f"Search files: {args.get('pattern', '?')}"
+        elif tool == "search_code":
+            return f"Search code index: {args.get('query', '?')}"
         else:
             return f"{tool}: {args}"
 
@@ -436,6 +439,74 @@ class ToolExecutor:
 
         except Exception as e:
             return {"error": f"Search error: {e}"}
+
+    async def _search_code(
+        self,
+        query: str,
+        hops: int = 1,
+        max_chunks: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Search code using BM25 + Knowledge Graph.
+
+        Uses the project's index created via /index command.
+        Returns relevant code chunks with their relationships.
+        """
+        try:
+            from tarang.context import get_retriever
+        except ImportError:
+            return {
+                "error": "Context retrieval module not available. Run 'pip install tarang' to install.",
+                "indexed": False,
+            }
+
+        # Get retriever for this project
+        retriever = get_retriever(self.project_root)
+
+        if retriever is None or not retriever.is_ready:
+            return {
+                "error": "Project not indexed. Run '/index' command first to build the code index.",
+                "indexed": False,
+                "hint": "The /index command creates a searchable index of your codebase using BM25 and a Symbol Knowledge Graph.",
+            }
+
+        try:
+            # Execute search
+            result = retriever.retrieve(
+                query=query,
+                hops=min(hops, 2),
+                max_chunks=min(max_chunks, 20),
+            )
+
+            # Format response
+            return {
+                "success": True,
+                "indexed": True,
+                "query": query,
+                "chunks": [
+                    {
+                        "id": c.id,
+                        "file": c.file,
+                        "type": c.type,
+                        "name": c.name,
+                        "signature": c.signature,
+                        "content": c.content,
+                        "line_start": c.line_start,
+                        "line_end": c.line_end,
+                    }
+                    for c in result.chunks
+                ],
+                "signatures": result.signatures,
+                "graph": result.graph_context,
+                "stats": result.stats,
+            }
+
+        except Exception as e:
+            logger.exception("search_code error")
+            return {
+                "error": f"Search failed: {e}",
+                "indexed": True,
+            }
 
     async def _get_file_info(self, file_path: str) -> Dict[str, Any]:
         """Get file metadata."""
