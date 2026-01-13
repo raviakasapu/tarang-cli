@@ -33,7 +33,7 @@ import httpx
 from rich.console import Console
 
 from tarang.context_collector import ProjectContext
-from tarang.context.retriever import get_retriever
+from tarang.context.retriever import create_retriever
 from tarang.ui.formatter import OutputFormatter
 
 logger = logging.getLogger(__name__)
@@ -359,7 +359,7 @@ class LocalToolExecutor:
             return {"error": "query required"}
 
         try:
-            retriever = get_retriever(self.project_root)
+            retriever = create_retriever(self.project_root)
             if retriever is None:
                 return {
                     "error": "Index not found. Run '/index' to create the code index.",
