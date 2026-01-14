@@ -349,6 +349,10 @@ class LocalToolExecutor:
 
         return {"matches": matches, "count": len(matches)}
 
+    # Track background indexing state
+    _indexing_in_progress = False
+    _index_result = None
+
     def _search_code(self, args: dict) -> dict:
         """Search codebase using BM25 + Knowledge Graph retriever."""
         query = args.get("query", "")
@@ -359,38 +363,75 @@ class LocalToolExecutor:
             return {"error": "query required"}
 
         try:
-            retriever = create_retriever(self.project_root)
+            # Construct the correct index path (.tarang/index/)
+            index_path = Path(self.project_root) / ".tarang" / "index"
+            retriever = create_retriever(index_path)
             if retriever is None:
-                return {
-                    "error": "Index not found. Run '/index' to create the code index.",
-                    "indexed": False,
-                }
+                # Index not found - start background indexing
+                return self._handle_missing_index(query)
 
             result = retriever.retrieve(query=query, hops=hops, max_chunks=max_chunks)
 
-            # Format chunks for response
+            # Format chunks for response (result is a RetrievalResult dataclass)
             chunks = []
-            for chunk in result.get("chunks", []):
+            for chunk in result.chunks:
                 chunks.append({
-                    "id": chunk.get("id", ""),
-                    "file": chunk.get("file", ""),
-                    "name": chunk.get("name", ""),
-                    "type": chunk.get("type", ""),
-                    "content": chunk.get("content", "")[:2000],  # Limit content size
-                    "line_start": chunk.get("line_start", 0),
-                    "signature": chunk.get("signature", ""),
+                    "id": chunk.id,
+                    "file": chunk.file,
+                    "name": chunk.name,
+                    "type": chunk.type,
+                    "content": chunk.content[:2000] if chunk.content else "",  # Limit content size
+                    "line_start": chunk.line_start,
+                    "signature": chunk.signature or "",
                 })
 
             return {
                 "success": True,
                 "chunks": chunks,
-                "signatures": result.get("signatures", []),
-                "graph": result.get("graph", {}),
+                "signatures": result.signatures,
+                "graph": result.graph_context,
                 "indexed": True,
             }
         except Exception as e:
             logger.exception("search_code error")
             return {"error": f"Search failed: {e}", "indexed": True}
+
+    def _handle_missing_index(self, query: str) -> dict:
+        """Handle missing index by building in background."""
+        import threading
+        from tarang.context import ProjectIndexer
+
+        # Check if indexing already in progress
+        if self._indexing_in_progress:
+            return {
+                "error": "Index is being built in background. Please use search_files or read_file for now.",
+                "indexed": False,
+                "indexing": True,
+            }
+
+        # Start background indexing
+        def build_index():
+            try:
+                LocalToolExecutor._indexing_in_progress = True
+                indexer = ProjectIndexer(self.project_root)
+                result = indexer.build(force=False)
+                LocalToolExecutor._index_result = result
+                logger.info(f"Background indexing complete: {result.files_indexed} files, {result.chunks_created} chunks")
+            except Exception as e:
+                logger.error(f"Background indexing failed: {e}")
+                LocalToolExecutor._index_result = {"error": str(e)}
+            finally:
+                LocalToolExecutor._indexing_in_progress = False
+
+        thread = threading.Thread(target=build_index, daemon=True)
+        thread.start()
+
+        return {
+            "error": "Index not found. Building index in background... Use search_files or read_file for now, then retry search_code.",
+            "indexed": False,
+            "indexing": True,
+            "hint": f"Alternative: use search_files with pattern matching for '{query[:30]}'",
+        }
 
     def _get_file_info(self, args: dict) -> dict:
         """Get metadata about a file."""
@@ -1099,7 +1140,11 @@ class TarangStreamClient:
 
         logger.info(f"[LOCAL] Executing tool: {tool} with args: {args} in {self.project_root}")
 
-        # Show tool request with Rich formatting
+        # Show progress indicator for read-only tools in compact mode
+        if not require_approval:
+            self.formatter.show_tool_progress(tool, args)
+
+        # Show tool request with Rich formatting (full preview for write operations)
         self.formatter.show_tool_request(tool, args, require_approval, description)
 
         if require_approval:

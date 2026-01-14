@@ -78,7 +78,10 @@ class OutputFormatter:
         "shell": "💻",
         "list_files": "📂",
         "search_files": "🔍",
+        "search_code": "🔎",
         "get_file_info": "ℹ️",
+        "validate_file": "✅",
+        "validate_build": "🔨",
     }
 
     # Tool colors
@@ -90,19 +93,26 @@ class OutputFormatter:
         "shell": "yellow",
         "list_files": "blue",
         "search_files": "magenta",
+        "search_code": "magenta",
         "get_file_info": "blue",
+        "validate_file": "green",
+        "validate_build": "yellow",
     }
 
-    def __init__(self, console: Optional[Console] = None, verbose: bool = False):
+    def __init__(self, console: Optional[Console] = None, verbose: bool = False, compact: bool = True):
         """
         Initialize the formatter.
 
         Args:
             console: Rich Console instance. Created if not provided.
             verbose: Show detailed output for all operations.
+            compact: Use compact single-line output for tools (default True).
         """
         self.console = console or Console()
         self.verbose = verbose
+        self.compact = compact
+        # Store pending tool requests for compact mode (to merge request + result)
+        self._pending_tool: Optional[Dict[str, Any]] = None
 
     def _get_language(self, file_path: str) -> str:
         """Detect language from file extension."""
@@ -118,6 +128,60 @@ class OutputFormatter:
         return self.TOOL_COLORS.get(tool, "white")
 
     # =========================================================================
+    # Tool Progress Indicators
+    # =========================================================================
+
+    # Descriptive action messages for tools (max 10 chars for alignment)
+    TOOL_ACTIONS = {
+        "read_file": "Read",
+        "write_file": "Write",
+        "edit_file": "Edit",
+        "delete_file": "Delete",
+        "list_files": "List",
+        "search_files": "Search",
+        "search_code": "Index",
+        "get_file_info": "Check",
+        "shell": "Run",
+        "validate_file": "Validate",
+        "validate_build": "Build",
+    }
+
+    def show_tool_progress(self, tool: str, args: Dict[str, Any]) -> None:
+        """
+        Show tool execution in progress.
+
+        In compact mode, we skip this and show the action in the result line instead.
+        This avoids duplicate lines and keeps output clean.
+        """
+        # In compact mode, we integrate action text into result line
+        # So no progress display needed - result will show "Read file.py (24 lines)"
+        if self.compact:
+            return
+
+        # Non-compact mode shows full progress
+        icon = self._get_icon(tool)
+        action = self.TOOL_ACTIONS.get(tool, "Running")
+
+        # Build target description
+        if tool == "read_file":
+            target = args.get("file_path", "")
+            target = target if len(target) <= 40 else "..." + target[-37:]
+        elif tool == "list_files":
+            target = args.get("path", ".")
+        elif tool in ("search_files", "search_code"):
+            target = f"'{args.get('pattern', args.get('query', ''))[:25]}'"
+        elif tool == "shell":
+            cmd = args.get("command", "")[:35].replace("\n", " ")
+            target = cmd
+        elif tool in ("write_file", "edit_file", "delete_file", "get_file_info"):
+            target = args.get("file_path", "")
+            target = target if len(target) <= 40 else "..." + target[-37:]
+        else:
+            target = ""
+
+        self.console.print(f"  [dim]{icon} {action} {target}...[/dim]")
+
+    # =========================================================================
     # Tool Request Display (Before Execution)
     # =========================================================================
 
@@ -131,6 +195,9 @@ class OutputFormatter:
         """
         Display a tool request before execution.
 
+        In compact mode, read-only tools are deferred to show_tool_result for single-line output.
+        Write operations that require approval still show full previews.
+
         Args:
             tool: Tool name (e.g., "write_file", "shell")
             args: Tool arguments
@@ -140,6 +207,12 @@ class OutputFormatter:
         icon = self._get_icon(tool)
         color = self._get_color(tool)
 
+        # In compact mode, defer read-only tools to show_tool_result
+        if self.compact and tool in ("read_file", "list_files", "search_files", "search_code", "get_file_info"):
+            self._pending_tool = {"tool": tool, "args": args, "description": description}
+            return
+
+        # Write operations always show full preview (need user to see what's changing)
         if tool == "write_file":
             self._show_write_file_request(args, description)
         elif tool == "edit_file":
@@ -283,6 +356,8 @@ class OutputFormatter:
         """
         Display the result of a tool execution.
 
+        In compact mode, shows a single-line summary combining request + result.
+
         Args:
             tool: Tool name
             args: Original tool arguments
@@ -291,8 +366,16 @@ class OutputFormatter:
         icon = self._get_icon(tool)
         color = self._get_color(tool)
 
+        # Clear pending tool
+        self._pending_tool = None
+
         if "error" in result:
-            self.console.print(f"  [red]✗ {tool} error: {result['error']}[/red]")
+            self.console.print(f"  [red]✗ {tool}: {result['error'][:60]}[/red]")
+            return
+
+        # Compact mode: single-line output for read-only tools
+        if self.compact and tool in ("read_file", "list_files", "search_files", "search_code", "get_file_info"):
+            self._show_compact_result(tool, args, result)
             return
 
         if tool == "read_file":
@@ -315,6 +398,54 @@ class OutputFormatter:
                 self.console.print(f"  [{color}]✓ {tool}: OK[/{color}]")
             else:
                 self.console.print(f"  [dim]{tool}: completed[/dim]")
+
+    # Width for action column alignment (longest: "Validate" = 8)
+    ACTION_WIDTH = 8
+
+    def _show_compact_result(self, tool: str, args: Dict[str, Any], result: Dict[str, Any], callback_ok: bool = True) -> None:
+        """Show compact single-line result for read-only tools with aligned columns."""
+        icon = self._get_icon(tool)
+        color = self._get_color(tool)
+        action = self.TOOL_ACTIONS.get(tool, "Done")
+        # Pad action to fixed width for alignment
+        action_padded = action.ljust(self.ACTION_WIDTH)
+        # Callback indicator on the right
+        cb = " [dim green]✓[/dim green]" if callback_ok else ""
+
+        if tool == "read_file":
+            file_path = args.get("file_path", "")
+            lines = result.get("lines", 0)
+            # Truncate long paths
+            display_path = file_path if len(file_path) <= 35 else "..." + file_path[-32:]
+            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] {display_path} [dim]({lines} lines)[/dim]{cb}")
+
+        elif tool == "list_files":
+            path = args.get("path", ".")
+            if len(path) > 30:
+                path = "..." + path[-27:]
+            count = result.get("count", len(result.get("files", [])))
+            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] {path} [dim]({count} files)[/dim]{cb}")
+
+        elif tool == "search_files":
+            pattern = args.get("pattern", "")[:25]
+            count = result.get("count", len(result.get("matches", [])))
+            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] '{pattern}' [dim]({count} matches)[/dim]{cb}")
+
+        elif tool == "search_code":
+            query = args.get("query", "")[:25]
+            chunks = len(result.get("chunks", []))
+            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] '{query}' [dim]({chunks} chunks)[/dim]{cb}")
+
+        elif tool == "get_file_info":
+            file_path = args.get("file_path", "")
+            exists = "exists" if result.get("exists") else "not found"
+            display_path = file_path if len(file_path) <= 35 else "..." + file_path[-32:]
+            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] {display_path} [dim]({exists})[/dim]{cb}")
+
+        else:
+            action = self.TOOL_ACTIONS.get(tool, tool)
+            action_padded = action.ljust(self.ACTION_WIDTH)
+            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}]{cb}")
 
     def _show_read_file_result(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Display read_file result with line count."""
@@ -340,10 +471,14 @@ class OutputFormatter:
         file_path = args.get("file_path", "")
         content = args.get("content", "")
         lines = content.count("\n") + 1 if content else 0
+        display_path = file_path if len(file_path) <= 40 else "..." + file_path[-37:]
 
         if result.get("success"):
-            self.console.print(f"  [green]✓ write_file:[/green] {file_path}")
-            self.console.print(f"    [dim]Created {lines} lines[/dim]")
+            if self.compact:
+                self.console.print(f"  [green]✓ 📝[/green] {display_path} [dim]({lines} lines)[/dim]")
+            else:
+                self.console.print(f"  [green]✓ write_file:[/green] {file_path}")
+                self.console.print(f"    [dim]Created {lines} lines[/dim]")
         else:
             self.console.print(f"  [red]✗ write_file:[/red] {file_path} - FAILED")
 
@@ -351,19 +486,27 @@ class OutputFormatter:
         """Display edit_file result with replacement count."""
         file_path = args.get("file_path", "")
         replacements = result.get("replacements", 1)
+        display_path = file_path if len(file_path) <= 40 else "..." + file_path[-37:]
 
         if result.get("success"):
-            self.console.print(f"  [cyan]✓ edit_file:[/cyan] {file_path}")
-            self.console.print(f"    [dim]{replacements} replacement(s) made[/dim]")
+            if self.compact:
+                self.console.print(f"  [cyan]✓ ✏️[/cyan]  {display_path} [dim]({replacements} edit{'s' if replacements > 1 else ''})[/dim]")
+            else:
+                self.console.print(f"  [cyan]✓ edit_file:[/cyan] {file_path}")
+                self.console.print(f"    [dim]{replacements} replacement(s) made[/dim]")
         else:
             self.console.print(f"  [red]✗ edit_file:[/red] {file_path} - FAILED")
 
     def _show_delete_file_result(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Display delete_file result."""
         file_path = args.get("file_path", "")
+        display_path = file_path if len(file_path) <= 40 else "..." + file_path[-37:]
 
         if result.get("success"):
-            self.console.print(f"  [red]✓ delete_file:[/red] {file_path} [dim](deleted)[/dim]")
+            if self.compact:
+                self.console.print(f"  [red]✓ 🗑️[/red]  {display_path} [dim](deleted)[/dim]")
+            else:
+                self.console.print(f"  [red]✓ delete_file:[/red] {file_path} [dim](deleted)[/dim]")
         else:
             self.console.print(f"  [red]✗ delete_file:[/red] {file_path} - FAILED")
 
@@ -374,23 +517,39 @@ class OutputFormatter:
         stdout = result.get("stdout", "")
         stderr = result.get("stderr", "")
 
+        # Compact command preview (first 40 chars)
+        cmd_preview = command[:40] + "..." if len(command) > 40 else command
+        cmd_preview = cmd_preview.replace("\n", " ")
+
         # Status line
         if exit_code == 0:
-            self.console.print(f"  [green]✓ shell:[/green] exit {exit_code}")
+            if self.compact:
+                self.console.print(f"  [green]✓ 💻[/green] {cmd_preview} [dim](exit 0)[/dim]")
+            else:
+                self.console.print(f"  [green]✓ shell:[/green] exit {exit_code}")
         else:
-            self.console.print(f"  [yellow]⚠ shell:[/yellow] exit {exit_code}")
+            if self.compact:
+                self.console.print(f"  [yellow]⚠ 💻[/yellow] {cmd_preview} [dim](exit {exit_code})[/dim]")
+            else:
+                self.console.print(f"  [yellow]⚠ shell:[/yellow] exit {exit_code}")
 
-        # Show stdout (up to 15 lines)
+        # Show stdout (up to 15 lines, or 5 in compact mode)
+        max_lines = 5 if self.compact else 15
         if stdout:
             stdout_lines = stdout.strip().split("\n")
-            self.console.print(Panel(
-                "\n".join(stdout_lines[:15]),
-                border_style="dim",
-                title="[dim]stdout[/dim]",
-                subtitle=f"[dim]{len(stdout_lines)} lines[/dim]" if len(stdout_lines) > 15 else None,
-            ))
-            if len(stdout_lines) > 15:
-                self.console.print(f"    [dim]... ({len(stdout_lines) - 15} more lines)[/dim]")
+            if self.compact and len(stdout_lines) <= 3:
+                # Very short output - show inline
+                for line in stdout_lines:
+                    self.console.print(f"    [dim]{line[:80]}[/dim]")
+            else:
+                self.console.print(Panel(
+                    "\n".join(stdout_lines[:max_lines]),
+                    border_style="dim",
+                    title="[dim]stdout[/dim]",
+                    subtitle=f"[dim]{len(stdout_lines)} lines[/dim]" if len(stdout_lines) > max_lines else None,
+                ))
+                if len(stdout_lines) > max_lines:
+                    self.console.print(f"    [dim]... ({len(stdout_lines) - max_lines} more lines)[/dim]")
 
         # Show stderr if present
         if stderr:
@@ -711,7 +870,10 @@ class OutputFormatter:
         self.console.print(f"[green]✓ {message}[/green]")
 
     def show_callback_status(self, success: bool, error: str = "") -> None:
-        """Show callback status (for SSE flow)."""
+        """Show callback status (for SSE flow). Silent in compact mode unless error."""
+        if self.compact and success:
+            # In compact mode, success is implied by the checkmark - no need to confirm
+            return
         if success:
             self.console.print("  [dim green]↳ callback OK[/dim green]")
         else:

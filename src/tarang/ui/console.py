@@ -18,6 +18,15 @@ from rich.rule import Rule
 from rich.live import Live
 from rich.layout import Layout
 
+# Try to import prompt_toolkit for command history (up/down arrows)
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory, InMemoryHistory
+    from prompt_toolkit.styles import Style as PTStyle
+    HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    HAS_PROMPT_TOOLKIT = False
+
 
 class TarangConsole:
     """Rich console for Tarang CLI with Aider-like UI."""
@@ -43,6 +52,27 @@ class TarangConsole:
         self.verbose = verbose
         self.project_path: Optional[Path] = None
 
+        # Initialize command history for up/down arrow navigation
+        self._prompt_session = None
+        if HAS_PROMPT_TOOLKIT:
+            # Store history in ~/.tarang/history
+            history_path = Path.home() / ".tarang" / "history"
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                history = FileHistory(str(history_path))
+            except Exception:
+                history = InMemoryHistory()
+
+            # Style to match Rich prompt
+            style = PTStyle.from_dict({
+                'prompt': 'bold cyan',
+            })
+            self._prompt_session = PromptSession(
+                history=history,
+                style=style,
+                enable_history_search=True,  # Ctrl+R for reverse search
+            )
+
     def print_banner(self, version: str, project_path: Path):
         """Print the startup banner with project info."""
         self.project_path = project_path
@@ -59,7 +89,7 @@ class TarangConsole:
     def print_instructions(self):
         """Print usage instructions with matching colors."""
         self.console.print("[green]Type your instructions[/], or [cyan]/help[/] for commands")
-        self.console.print("[bold]ESC[/][green]=[/]cancel  [bold]SPACE[/][cyan]=[/]add instruction")
+        self.console.print("[bold]↑/↓[/][dim]=[/]history  [bold]ESC[/][green]=[/]cancel  [bold]SPACE[/][cyan]=[/]add instruction")
         self.console.print()
 
     def print_project_stats(self, total_files: int, total_lines: int):
@@ -149,9 +179,52 @@ class TarangConsole:
             self.console.print(f"[dim italic]💭 {thought[:200]}...[/dim italic]")
 
     def prompt_input(self) -> str:
-        """Get user input with styled prompt."""
+        """
+        Get user input with styled prompt (sync version).
+
+        Features:
+        - Up/Down arrows: Navigate command history
+        - Ctrl+R: Reverse search through history
+        - History persisted to ~/.tarang/history
+        """
+        import asyncio
+
         try:
-            return Prompt.ask("[bold cyan]You[/]", console=self.console)
+            if self._prompt_session:
+                # Check if we're in an async context
+                try:
+                    loop = asyncio.get_running_loop()
+                    # We're in async context - use nest_asyncio or run in executor
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(self._prompt_session.prompt, "You> ")
+                        return future.result()
+                except RuntimeError:
+                    # No running loop - use sync version
+                    return self._prompt_session.prompt("You> ")
+            else:
+                # Fallback to Rich prompt (no history)
+                return Prompt.ask("[bold cyan]You[/]", console=self.console)
+        except (KeyboardInterrupt, EOFError):
+            return ""
+
+    async def prompt_input_async(self) -> str:
+        """
+        Get user input with styled prompt (async version).
+
+        Use this when calling from async context.
+        """
+        try:
+            if self._prompt_session:
+                return await self._prompt_session.prompt_async("You> ")
+            else:
+                # Fallback - run sync in executor
+                import asyncio
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None,
+                    lambda: Prompt.ask("[bold cyan]You[/]", console=self.console)
+                )
         except (KeyboardInterrupt, EOFError):
             return ""
 

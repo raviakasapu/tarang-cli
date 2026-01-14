@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarang"
-version = "4.0.1"
+version = "4.1.0"
 description = "Tarang - AI Coding Agent (Hybrid WebSocket Architecture)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,6 +33,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
     "websockets>=12.0",
+    # Command history with up/down arrows
+    "prompt_toolkit>=3.0.0",
     # Context retrieval system (PRD-8)
     "rank-bm25>=0.2.2",
     "tree-sitter>=0.23.0",

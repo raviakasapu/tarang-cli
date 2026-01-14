@@ -333,7 +333,7 @@ async def _run_hybrid_session(
                 if not instr:
                     # Get instruction from user
                     try:
-                        instr = ui.prompt_input()
+                        instr = await ui.prompt_input_async()
                         if not instr.strip():
                             continue
 
@@ -411,6 +411,60 @@ async def _run_hybrid_session(
         sys.exit(1)
 
 
+async def _ensure_index(ui: TarangConsole, project_path: Path, verbose: bool) -> None:
+    """
+    Smart indexing strategy:
+    - Small projects (<100 files): Auto-index silently
+    - Large projects: Prompt user
+    - Already indexed: Skip
+    """
+    from tarang.context import ProjectIndexer
+    import os
+
+    indexer = ProjectIndexer(project_path)
+
+    # Check if already indexed
+    if indexer.exists() and not indexer.is_stale():
+        if verbose:
+            stats = indexer.stats()
+            ui.console.print(f"[dim]Index ready: {stats.get('chunks', 0)} chunks, {stats.get('symbols', 0)} symbols[/dim]")
+        return
+
+    # Count project files quickly (without full scan)
+    file_count = 0
+    SMALL_PROJECT_THRESHOLD = 100
+    IGNORE_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", ".tarang"}
+
+    for root, dirs, files in os.walk(project_path):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        file_count += len([f for f in files if not f.startswith(".")])
+        if file_count > SMALL_PROJECT_THRESHOLD:
+            break  # Large project, stop counting
+
+    is_small = file_count <= SMALL_PROJECT_THRESHOLD
+
+    if is_small:
+        # Auto-index silently for small projects
+        ui.console.print("[dim]Building code index...[/dim]")
+        try:
+            result = indexer.build(force=False)
+            ui.console.print(f"[dim green]✓ Indexed {result.files_indexed} files ({result.chunks_created} chunks)[/dim green]")
+        except Exception as e:
+            ui.console.print(f"[dim yellow]Index build skipped: {e}[/dim yellow]")
+    else:
+        # Prompt for large projects
+        ui.console.print(f"[yellow]Project has {file_count}+ files and no code index.[/yellow]")
+        if ui.confirm("Build code index for smarter context? (takes ~30s)", default=True):
+            ui.console.print("[dim]Building code index...[/dim]")
+            try:
+                result = indexer.build(force=False)
+                ui.console.print(f"[green]✓ Indexed {result.files_indexed} files ({result.chunks_created} chunks, {result.duration_ms}ms)[/green]")
+            except Exception as e:
+                ui.print_error(f"Index build failed: {e}")
+        else:
+            ui.console.print("[dim]Skipped. Run /index manually when ready.[/dim]")
+
+
 async def _run_stream_session(
     ui: TarangConsole,
     creds: dict,
@@ -435,9 +489,14 @@ async def _run_stream_session(
     - SPACE: Pause and add extra instruction
     """
     from tarang.context_collector import collect_context, ProjectContext
-    from tarang.context import get_retriever
+    from tarang.context import get_retriever, ProjectIndexer
     from tarang.stream import TarangStreamClient, EventType, FileChange
     from tarang.ui.keyboard import KeyboardMonitor, KeyAction, create_keyboard_hints
+
+    # =========================================================================
+    # Smart Indexing on Session Start
+    # =========================================================================
+    await _ensure_index(ui, project_path, verbose)
 
     # Create keyboard monitor first (needed for callbacks)
     keyboard = KeyboardMonitor(
@@ -467,7 +526,7 @@ async def _run_stream_session(
         # Get instruction from user
         if not instruction:
             try:
-                instruction = ui.prompt_input()
+                instruction = await ui.prompt_input_async()
                 if not instruction.strip():
                     continue
 
@@ -570,16 +629,27 @@ async def _run_stream_session(
                 elif event.type == EventType.THINKING:
                     # Agent thinking/reasoning
                     msg = event.data.get("message", "Thinking...")
-                    # Extract worker name if present (e.g., "[explorer] Using read_file...")
+
+                    # Skip "Using..." tool messages - the tool result will show instead
+                    if "Using " in msg and any(tool in msg for tool in ("read_file", "list_files", "search_files", "search_code", "get_file_info", "write_file", "edit_file", "shell")):
+                        continue
+
+                    # Extract worker name if present (e.g., "[explorer] Analyzing structure...")
                     if msg.startswith("[") and "]" in msg:
                         worker_end = msg.index("]")
                         worker_name = msg[1:worker_end]
                         action = msg[worker_end + 2:]
+
+                        # Skip tool-related messages (handled by tool output)
+                        if action.strip().startswith("Using "):
+                            continue
+
                         if verbose:
                             ui.console.print(f"  [dim cyan]💭 {worker_name}: {action}[/dim cyan]")
                         else:
-                            # Minimal indicator
-                            ui.console.print(f"  [dim]• {action[:60]}{'...' if len(action) > 60 else ''}[/dim]")
+                            # Show actual thinking, skip generic "Step N" style messages
+                            if action and not action.startswith("Step "):
+                                ui.console.print(f"  [dim]💭 {action[:60]}{'...' if len(action) > 60 else ''}[/dim]")
                     else:
                         if verbose:
                             ui.console.print(f"  [dim cyan]💭 {msg}[/dim cyan]")
