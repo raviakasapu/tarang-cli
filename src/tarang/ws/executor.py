@@ -312,7 +312,12 @@ class ToolExecutor:
         max_files: int = 500,
     ) -> Dict[str, Any]:
         """List files in a directory."""
-        dir_path = self._resolve_path(path)
+        # Handle absolute paths directly
+        path_obj = Path(path)
+        if path_obj.is_absolute():
+            dir_path = path_obj.resolve()
+        else:
+            dir_path = self._resolve_path(path)
 
         if not dir_path.exists():
             return {"error": f"Directory not found: {path}"}
@@ -338,7 +343,15 @@ class ToolExecutor:
                 if pattern and not fnmatch.fnmatch(item.name, pattern):
                     continue
 
-                rel_path = str(item.relative_to(self.project_root))
+                # Try relative to project_root first, then to dir_path
+                try:
+                    rel_path = str(item.relative_to(self.project_root))
+                except ValueError:
+                    # Path is outside project_root, use relative to dir_path
+                    try:
+                        rel_path = str(item.relative_to(dir_path))
+                    except ValueError:
+                        continue
 
                 if item.is_file():
                     files.append(rel_path)

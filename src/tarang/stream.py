@@ -185,7 +185,13 @@ class LocalToolExecutor:
         recursive = args.get("recursive", True)
         max_files = args.get("max_files", 500)
 
-        target = self.project_root / path
+        # Handle absolute paths - resolve them directly
+        path_obj = Path(path)
+        if path_obj.is_absolute():
+            target = path_obj.resolve()
+        else:
+            target = (self.project_root / path).resolve()
+
         if not target.exists():
             return {"error": f"Path not found: {path}"}
 
@@ -203,11 +209,16 @@ class LocalToolExecutor:
                         continue
 
                     full_path = Path(root) / filename
+                    # Try relative to project_root first, then to target directory
                     try:
                         rel_path = str(full_path.relative_to(self.project_root))
-                        files.append(rel_path)
                     except ValueError:
-                        continue
+                        # Target is outside project_root, use relative to target
+                        try:
+                            rel_path = str(full_path.relative_to(target))
+                        except ValueError:
+                            continue
+                    files.append(rel_path)
 
                     if len(files) >= max_files:
                         break
@@ -220,11 +231,15 @@ class LocalToolExecutor:
                     # Apply pattern filter if provided
                     if pattern and not fnmatch.fnmatch(item.name, pattern):
                         continue
+                    # Try relative to project_root first, then to target directory
                     try:
                         rel_path = str(item.relative_to(self.project_root))
-                        files.append(rel_path)
                     except ValueError:
-                        continue
+                        try:
+                            rel_path = str(item.relative_to(target))
+                        except ValueError:
+                            continue
+                    files.append(rel_path)
 
                     if len(files) >= max_files:
                         break
