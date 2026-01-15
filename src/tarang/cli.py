@@ -576,6 +576,9 @@ async def _run_stream_session(
         current_phase = None
         extra_instructions = []  # Queue of extra instructions from SPACE
 
+        # Initialize phase tracker for checklist display
+        phase_tracker = client.formatter.init_phase_tracker()
+
         # Start keyboard monitoring
         keyboard.start()
 
@@ -610,19 +613,19 @@ async def _run_stream_session(
                     delegation = event.data.get("delegation", "")
                     task = event.data.get("task", "")
 
-                    # Worker start/done events
+                    # Worker start/done events - update phase tracker
                     if worker:
                         if "completed" in msg.lower() or "done" in msg.lower():
-                            client.formatter.show_worker_done(worker, success=True)
+                            phase_tracker.complete_worker(worker)
                         else:
-                            client.formatter.show_worker_start(worker, task)
+                            phase_tracker.start_worker(worker, task)
                     # Delegation events
                     elif delegation:
                         client.formatter.show_delegation("agent", delegation, task)
                     # Phase transitions
                     elif phase and phase != current_phase:
                         current_phase = phase
-                        client.formatter.show_phase_start(phase)
+                        phase_tracker.start_phase(phase)
                     elif verbose:
                         ui.console.print(f"[dim]{msg}[/dim]")
 
@@ -655,21 +658,25 @@ async def _run_stream_session(
                             ui.console.print(f"  [dim cyan]💭 {msg}[/dim cyan]")
 
                 elif event.type == EventType.TOOL_DONE:
-                    # Tool execution completed (already handled internally)
+                    # Tool execution completed - track in phase tracker
                     tool = event.data.get("tool", "")
+                    phase_tracker.increment_tool()
                     if verbose:
                         ui.console.print(f"  [dim]  ✓ {tool}[/dim]")
 
                 elif event.type == EventType.PLAN:
-                    # Strategic plan from orchestrator
+                    # Strategic plan from orchestrator - renders ONCE
                     plan = event.data.get("plan", event.data)
                     phases = event.data.get("phases", [])
 
-                    # Use new formatter if we have phases
+                    # Initialize phase tracker with plan (set_plan skips if already set)
                     if phases or plan.get("prd"):
-                        client.formatter.show_strategic_plan(plan)
+                        phase_tracker.set_plan(plan)
+                    elif phases:
+                        # Architect's task decomposition
+                        phase_tracker.set_worker_tasks(phases)
                     else:
-                        # Legacy format
+                        # Legacy format - just show it
                         desc = event.data.get("description", "")
                         steps = event.data.get("steps", [])
                         files = event.data.get("files", [])
@@ -685,9 +692,54 @@ async def _run_stream_session(
                             for f in files[:10]:
                                 ui.console.print(f"  • {f}")
 
-                    # Also show task decomposition if phases have tasks
-                    if phases:
-                        client.formatter.show_task_decomposition(phases)
+                elif event.type == EventType.PHASE_UPDATE:
+                    # Phase status update (no re-render, just update state)
+                    phase_index = event.data.get("phase_index", 0)
+                    phase_name = event.data.get("phase_name", "")
+                    status = event.data.get("status", "running")
+                    phase_tracker.update_phase_status(phase_name, status, phase_index)
+                    # Show inline status update
+                    ui.console.print(f"  [dim]↳ Phase {phase_index + 1}: {status}[/dim]")
+
+                elif event.type == EventType.WORKER_UPDATE:
+                    # Worker status update (no re-render, just update state)
+                    worker = event.data.get("worker", "")
+                    task = event.data.get("task", "")
+                    status = event.data.get("status", "running")
+                    phase_tracker.update_worker_status(worker, task, status)
+                    # Show inline worker update
+                    if status == "completed":
+                        ui.console.print(f"  [green]✓ {worker}[/green]")
+                    else:
+                        ui.console.print(f"  [dim]↳ {worker}[/dim]")
+                        if task:
+                            # Show task on separate line, wrap at 80 chars
+                            task_display = task[:160] + "..." if len(task) > 160 else task
+                            ui.console.print(f"    [dim italic]{task_display}[/dim italic]")
+
+                elif event.type == EventType.PHASE_SUMMARY:
+                    # Individual phase summary - display immediately as it completes
+                    phase_index = event.data.get("phase_index", 0)
+                    phase_name = event.data.get("phase_name", f"Phase {phase_index + 1}")
+                    summary = event.data.get("summary", "")
+                    status = event.data.get("status", "completed")
+                    total_phases = event.data.get("total_phases", 1)
+
+                    # Display phase summary in a panel
+                    from rich.panel import Panel
+                    from rich.markdown import Markdown
+
+                    status_icon = "✓" if status == "completed" else "⚠"
+                    status_color = "green" if status == "completed" else "yellow"
+
+                    # Show summary panel
+                    ui.console.print()
+                    ui.console.print(Panel(
+                        Markdown(summary),
+                        title=f"[bold {status_color}]{status_icon} {phase_name}[/] ({phase_index + 1}/{total_phases})",
+                        border_style=status_color,
+                        padding=(1, 2),
+                    ))
 
                 elif event.type == EventType.CHANGE:
                     change = FileChange.from_dict(event.data)

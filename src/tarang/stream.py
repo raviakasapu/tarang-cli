@@ -46,10 +46,13 @@ class EventType(str, Enum):
     TOOL_CALL = "tool_call"  # New name (SSE Split Architecture)
     TOOL_DONE = "tool_done"
     THINKING = "thinking"  # Agent thinking/reasoning
-    PLAN = "plan"  # Strategic plan from orchestrator
-    PHASE_START = "phase_start"  # Phase beginning
-    WORKER_START = "worker_start"  # Worker beginning
-    WORKER_DONE = "worker_done"  # Worker completed
+    PLAN = "plan"  # Strategic plan from orchestrator (emitted ONCE)
+    PHASE_UPDATE = "phase_update"  # Phase status change (no re-render)
+    PHASE_SUMMARY = "phase_summary"  # Individual phase summary (display immediately)
+    WORKER_UPDATE = "worker_update"  # Worker status change (no re-render)
+    PHASE_START = "phase_start"  # Phase beginning (legacy)
+    WORKER_START = "worker_start"  # Worker beginning (legacy)
+    WORKER_DONE = "worker_done"  # Worker completed (legacy)
     DELEGATION = "delegation"  # Agent delegation
     CHANGE = "change"
     CONTENT = "content"

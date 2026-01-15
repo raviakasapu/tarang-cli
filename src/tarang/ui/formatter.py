@@ -12,11 +12,201 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from dataclasses import dataclass, field
+from typing import List
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 from rich.table import Table
+
+
+@dataclass
+class PhaseStatus:
+    """Status of a single phase in the plan."""
+    name: str
+    worker: str = ""
+    goals: str = ""
+    status: str = "pending"  # pending, running, completed, failed
+    current_step: str = ""  # Current worker task being executed
+
+
+@dataclass
+class PhaseTracker:
+    """
+    Tracks execution progress through phases and worker steps.
+
+    Provides a live-updating checklist view of:
+    - PRD phases from orchestrator
+    - Worker steps from architect
+    - Tool calls within each step
+    """
+    console: Console
+    phases: List[PhaseStatus] = field(default_factory=list)
+    prd_title: str = ""
+    prd_requirements: List[str] = field(default_factory=list)
+    current_phase_index: int = 0
+    current_worker: str = ""
+    tool_count: int = 0
+
+    def set_plan(self, plan: dict) -> None:
+        """Initialize tracker with orchestrator's plan. Renders ONCE."""
+        # Skip if plan already set (prevent duplicate renders)
+        if self.phases:
+            return
+
+        prd = plan.get("prd", {})
+        phases = plan.get("phases", [])
+
+        self.prd_title = prd.get("title", "")
+        self.prd_requirements = prd.get("requirements", [])
+
+        self.phases = [
+            PhaseStatus(
+                name=p.get("name", f"Phase {i+1}"),
+                worker=p.get("worker", ""),
+                goals=p.get("goals", ""),  # Store full goals
+            )
+            for i, p in enumerate(phases)
+        ]
+        self.current_phase_index = 0
+        self.render()
+
+    def set_worker_tasks(self, tasks: list) -> None:
+        """Set architect's decomposed tasks as phases."""
+        self.phases = []
+        for i, t in enumerate(tasks):
+            if isinstance(t, dict):
+                worker = t.get("worker", "coder")
+                goals = t.get("goals", "")
+                # For architect tasks, use worker name + brief goal as the name
+                name = f"{worker}: {goals[:50]}..." if len(goals) > 50 else f"{worker}: {goals}" if goals else f"Step {i+1}"
+            else:
+                worker = "coder"
+                goals = str(t)
+                name = f"Step {i+1}: {goals[:50]}..." if len(goals) > 50 else f"Step {i+1}: {goals}"
+
+            self.phases.append(PhaseStatus(
+                name=name,
+                worker=worker,
+                goals="",  # Don't show goals separately for architect tasks
+            ))
+        self.current_phase_index = 0
+        self.render()
+
+    def start_phase(self, phase_name: str) -> None:
+        """Mark a phase as running (with render)."""
+        self.update_phase_status(phase_name, "running")
+        self.render()
+
+    def start_worker(self, worker: str, task: str = "") -> None:
+        """Mark current phase's worker as active (with render)."""
+        self.update_worker_status(worker, task, "running")
+        self.render()
+
+    def complete_worker(self, worker: str) -> None:
+        """Mark worker complete and advance to next phase (with render)."""
+        self.update_worker_status(worker, "", "completed")
+        self.render()
+
+    def update_phase_status(self, phase_name: str, status: str, phase_index: int = -1) -> None:
+        """Update phase status WITHOUT rendering. Use for incremental updates."""
+        if phase_index >= 0 and phase_index < len(self.phases):
+            self.phases[phase_index].status = status
+            self.current_phase_index = phase_index
+        else:
+            # Find matching phase by name or use current index
+            for i, p in enumerate(self.phases):
+                if p.name == phase_name or i == self.current_phase_index:
+                    p.status = status
+                    self.current_phase_index = i
+                    break
+
+    def update_worker_status(self, worker: str, task: str = "", status: str = "running") -> None:
+        """Update worker status WITHOUT rendering. Use for incremental updates."""
+        if status == "completed":
+            if self.phases and self.current_phase_index < len(self.phases):
+                self.phases[self.current_phase_index].status = "completed"
+                self.phases[self.current_phase_index].current_step = ""
+                self.current_phase_index += 1
+            self.current_worker = ""
+            self.tool_count = 0
+        else:
+            self.current_worker = worker
+            self.tool_count = 0
+            if self.phases and self.current_phase_index < len(self.phases):
+                self.phases[self.current_phase_index].current_step = f"{worker}: {task[:40]}..." if task else worker
+                self.phases[self.current_phase_index].status = "running"
+
+    def increment_tool(self) -> None:
+        """Track tool call within current step."""
+        self.tool_count += 1
+
+    def render(self) -> None:
+        """Render the current checklist state."""
+        if not self.phases:
+            return
+
+        # Clear previous output and render fresh
+        lines = []
+
+        # Title
+        if self.prd_title:
+            lines.append(f"[bold blue]📋 {self.prd_title}[/bold blue]")
+            lines.append("")
+
+        # Phase checklist
+        for i, phase in enumerate(self.phases):
+            # Status icon
+            if phase.status == "completed":
+                icon = "[green]✓[/green]"
+                style = "dim"
+            elif phase.status == "running":
+                icon = "[yellow]▶[/yellow]"
+                style = "bold"
+            elif phase.status == "failed":
+                icon = "[red]✗[/red]"
+                style = "red"
+            else:
+                icon = "[dim]○[/dim]"
+                style = "dim"
+
+            # Phase line - show full name for orchestrator phases (when PRD exists)
+            worker_badge = f"[cyan]{phase.worker}[/cyan]" if phase.worker else ""
+
+            # For orchestrator phases (has PRD title), show full name
+            # For architect phases (no PRD), show shorter name
+            if self.prd_title:
+                name_display = phase.name  # Full name for orchestrator
+            else:
+                name_display = phase.name if len(phase.name) <= 40 else phase.name[:37] + "..."
+
+            line = f"  {icon} [{style}]{name_display}[/{style}]"
+            if worker_badge:
+                line += f" {worker_badge}"
+
+            lines.append(line)
+
+            # Show goals for orchestrator phases (when PRD exists and goals present)
+            if self.prd_title and phase.goals and phase.status != "completed":
+                # Wrap goals at ~70 chars for readability
+                goals_display = phase.goals[:120] + "..." if len(phase.goals) > 120 else phase.goals
+                lines.append(f"      [dim italic]{goals_display}[/dim italic]")
+
+            # Current step (if running)
+            if phase.status == "running" and phase.current_step:
+                tool_info = f" ({self.tool_count} tools)" if self.tool_count > 0 else ""
+                lines.append(f"      [dim]→ {phase.current_step}{tool_info}[/dim]")
+
+        # Progress summary
+        completed = sum(1 for p in self.phases if p.status == "completed")
+        total = len(self.phases)
+        lines.append("")
+        lines.append(f"  [dim]Progress: {completed}/{total} phases[/dim]")
+
+        # Print all lines
+        self.console.print("\n".join(lines))
 
 
 class OutputFormatter:
@@ -113,6 +303,13 @@ class OutputFormatter:
         self.compact = compact
         # Store pending tool requests for compact mode (to merge request + result)
         self._pending_tool: Optional[Dict[str, Any]] = None
+        # Phase tracker for checklist display
+        self.phase_tracker: Optional[PhaseTracker] = None
+
+    def init_phase_tracker(self) -> PhaseTracker:
+        """Initialize and return a phase tracker for this session."""
+        self.phase_tracker = PhaseTracker(console=self.console)
+        return self.phase_tracker
 
     def _get_language(self, file_path: str) -> str:
         """Detect language from file extension."""
@@ -848,12 +1045,31 @@ class OutputFormatter:
             to_agent: Target agent
             task: Task being delegated
         """
-        self.console.print(f"  [dim]↳ {from_agent} → {to_agent}[/dim]", end="")
+        self.console.print(f"  [dim]↳ {from_agent} → {to_agent}[/dim]")
         if task:
-            display_task = task[:40] + "..." if len(task) > 40 else task
-            self.console.print(f" [dim italic]({display_task})[/dim italic]")
-        else:
-            self.console.print()
+            # Show full task on separate line(s) for better readability
+            # Wrap at 80 chars per line, max 3 lines
+            max_line_len = 80
+            max_lines = 3
+            lines = []
+            remaining = task
+            while remaining and len(lines) < max_lines:
+                if len(remaining) <= max_line_len:
+                    lines.append(remaining)
+                    remaining = ""
+                else:
+                    # Find break point (space near max_line_len)
+                    break_at = remaining.rfind(" ", 0, max_line_len)
+                    if break_at == -1:
+                        break_at = max_line_len
+                    lines.append(remaining[:break_at])
+                    remaining = remaining[break_at:].lstrip()
+
+            if remaining:
+                lines[-1] = lines[-1][:max_line_len - 3] + "..."
+
+            for line in lines:
+                self.console.print(f"    [dim italic]{line}[/dim italic]")
 
     def show_thinking(self, message: str) -> None:
         """Show thinking/reasoning indicator."""
