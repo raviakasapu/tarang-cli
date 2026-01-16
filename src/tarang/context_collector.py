@@ -35,6 +35,7 @@ class ProjectContext:
     files: List[str] = field(default_factory=list)
     relevant_files: List[FileContent] = field(default_factory=list)
     _indexed_context: Optional[dict] = field(default=None, repr=False)
+    _folder_tree: Optional[str] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for API."""
@@ -46,6 +47,10 @@ class ProjectContext:
                 for f in self.relevant_files
             ],
         }
+
+        # Include folder tree for project structure understanding
+        if self._folder_tree:
+            result["folder_tree"] = self._folder_tree
 
         # Include indexed context if available (BM25 + KG retrieval)
         if self._indexed_context:
@@ -109,6 +114,25 @@ class ContextCollector:
     # Max content per file
     MAX_CONTENT_LINES = 300
 
+    # Config file extensions to auto-include from root (reveals project type)
+    CONFIG_EXTENSIONS = {
+        ".json", ".toml", ".yaml", ".yml", ".lock",
+        ".config.js", ".config.ts",
+    }
+
+    # Config filenames (no extension or special names)
+    CONFIG_NAMES = {
+        "Dockerfile", "Makefile", "Gemfile", "Procfile",
+        "requirements.txt", "setup.py", "setup.cfg",
+        ".gitignore", ".env.example",
+    }
+
+    # Skip these even if they match (too large or not useful)
+    SKIP_CONFIG_FILES = {
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "poetry.lock", "Cargo.lock", "composer.lock",
+    }
+
     def __init__(self, project_root: str):
         self.project_root = Path(project_root).resolve()
 
@@ -125,6 +149,12 @@ class ContextCollector:
         # Get all files
         all_files = self._scan_files()
 
+        # Build folder structure tree (helps LLM understand project layout)
+        folder_tree = self._build_folder_tree(all_files)
+
+        # ALWAYS include project identity files first (reduces tool calls!)
+        identity_files = self._collect_identity_files()
+
         # Find relevant files based on instruction
         relevant_paths = self._find_relevant_files(instruction, all_files)
 
@@ -133,18 +163,117 @@ class ContextCollector:
             # Small project - read all code files
             relevant_paths = all_files
 
-        # Read relevant file contents
-        relevant_files = []
-        for path in relevant_paths[:self.MAX_RELEVANT_FILES]:
-            content = self._read_file(path)
-            if content:
-                relevant_files.append(content)
+        # Combine: identity files first, then instruction-relevant files
+        # (avoiding duplicates)
+        identity_paths = {f.path for f in identity_files}
+        additional_files = []
+        for path in relevant_paths:
+            if path not in identity_paths:
+                content = self._read_file(path)
+                if content:
+                    additional_files.append(content)
+                    if len(identity_files) + len(additional_files) >= self.MAX_RELEVANT_FILES:
+                        break
 
-        return ProjectContext(
+        relevant_files = identity_files + additional_files
+
+        context = ProjectContext(
             cwd=str(self.project_root),
             files=all_files[:self.MAX_FILES],
             relevant_files=relevant_files,
         )
+
+        # Add folder tree as metadata
+        context._folder_tree = folder_tree
+
+        return context
+
+    def _collect_identity_files(self) -> List[FileContent]:
+        """
+        Collect root-level config files that reveal project type.
+
+        Reads actual files in root directory (not a hardcoded list).
+        Skips .md files, lock files, and other non-config files.
+        """
+        identity_files = []
+
+        # Scan root directory only (not recursive)
+        try:
+            for item in self.project_root.iterdir():
+                if not item.is_file():
+                    continue
+
+                filename = item.name
+
+                # Skip ignored files
+                if self._should_ignore(filename):
+                    continue
+
+                # Skip lock files and other large files
+                if filename in self.SKIP_CONFIG_FILES:
+                    continue
+
+                # Skip markdown files (user specified: non .md)
+                if filename.endswith(".md"):
+                    continue
+
+                # Include if it's a config file (by extension or name)
+                is_config = (
+                    item.suffix.lower() in self.CONFIG_EXTENSIONS
+                    or filename in self.CONFIG_NAMES
+                    or filename.startswith(".")  # dotfiles like .eslintrc
+                )
+
+                if is_config:
+                    content = self._read_file(filename)
+                    if content:
+                        identity_files.append(content)
+
+        except OSError:
+            pass
+
+        return identity_files
+
+    def _build_folder_tree(self, files: List[str], max_depth: int = 3) -> str:
+        """
+        Build a folder structure tree string.
+
+        This helps LLM understand project layout without calling list_files.
+        """
+        # Build directory structure
+        dirs: Set[str] = set()
+        root_files: List[str] = []
+
+        for f in files:
+            parts = Path(f).parts
+            if len(parts) == 1:
+                root_files.append(f)
+            else:
+                # Add all parent directories up to max_depth
+                for i in range(1, min(len(parts), max_depth + 1)):
+                    dirs.add("/".join(parts[:i]))
+
+        # Build tree string
+        lines = ["."]
+
+        # Root files first
+        for f in sorted(root_files)[:10]:
+            lines.append(f"├── {f}")
+        if len(root_files) > 10:
+            lines.append(f"├── ... ({len(root_files) - 10} more files)")
+
+        # Then directories
+        sorted_dirs = sorted(dirs)
+        for d in sorted_dirs[:20]:
+            depth = d.count("/")
+            indent = "│   " * depth
+            name = d.split("/")[-1]
+            lines.append(f"{indent}├── {name}/")
+
+        if len(sorted_dirs) > 20:
+            lines.append(f"... ({len(sorted_dirs) - 20} more directories)")
+
+        return "\n".join(lines)
 
     def _scan_files(self) -> List[str]:
         """Scan project for all files."""

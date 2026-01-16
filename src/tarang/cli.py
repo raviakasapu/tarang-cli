@@ -776,7 +776,10 @@ async def _run_stream_session(
                     ui.print_error(msg)
 
                 elif event.type == EventType.COMPLETE:
-                    if verbose:
+                    duration_s = event.data.get("duration_s")
+                    if duration_s is not None:
+                        ui.console.print(f"[green]✓ Complete[/green]" + " " * 40 + f"[dim]{duration_s}s[/dim]")
+                    elif verbose:
                         ui.console.print("[dim]✓ Complete[/dim]")
 
             # Apply changes - stop keyboard monitor for clean prompts

@@ -148,6 +148,8 @@ class LocalToolExecutor:
                 return self._list_files(args)
             elif tool == "read_file":
                 return self._read_file(args)
+            elif tool == "read_files":
+                return self._read_files(args)  # Batch read - more efficient
             elif tool == "search_files":
                 return self._search_files(args)
             elif tool == "search_code":
@@ -300,6 +302,43 @@ class LocalToolExecutor:
             }
         except Exception as e:
             return {"error": str(e)}
+
+    def _read_files(self, args: dict) -> dict:
+        """
+        Read multiple files in a single batch operation.
+
+        This is more efficient than calling read_file multiple times:
+        - Single tool call instead of N calls
+        - Reduces AI token overhead
+        """
+        file_paths = args.get("file_paths", [])
+
+        if not file_paths:
+            return {"error": "file_paths required"}
+
+        if len(file_paths) > 10:
+            return {"error": "Maximum 10 files per batch", "requested": len(file_paths)}
+
+        results = []
+        for file_path in file_paths:
+            result = self._read_file({"file_path": file_path})
+            results.append({
+                "path": file_path,
+                "content": result.get("content", ""),
+                "lines": result.get("lines", 0),
+                "error": result.get("error"),
+            })
+
+        # Summary stats
+        successful = sum(1 for r in results if not r.get("error"))
+        total_lines = sum(r.get("lines", 0) for r in results)
+
+        return {
+            "files": results,
+            "count": len(results),
+            "successful": successful,
+            "total_lines": total_lines,
+        }
 
     def _search_files(self, args: dict) -> dict:
         """Search for pattern in files."""
@@ -1210,12 +1249,11 @@ class TarangStreamClient:
                     # Resume keyboard monitor
                     self._on_input_end()
 
+        # Track timing (after approval, measures execution + network round-trip)
+        start_time = time.time()
+
         # Execute tool locally
         result = self._execute_tool(tool, args)
-
-        # Show result with Rich formatting
-        self.formatter.show_tool_result(tool, args, result)
-        logger.info(f"[LOCAL] Tool result: {result.get('success', 'completed')}")
 
         # Send result via callback
         callback_url = f"{self.base_url}/api/callback"
@@ -1227,6 +1265,7 @@ class TarangStreamClient:
 
         logger.info(f"[LOCAL] Sending callback to {callback_url} for task {self.current_task_id}")
 
+        callback_ok = False
         try:
             resp = await client.post(
                 callback_url,
@@ -1235,13 +1274,21 @@ class TarangStreamClient:
             )
             if resp.status_code != 200:
                 logger.error(f"Callback failed: {resp.status_code} - {resp.text}")
-                self.formatter.show_callback_status(False, f"{resp.status_code}")
             else:
                 logger.info(f"[LOCAL] Callback sent successfully")
-                self.formatter.show_callback_status(True)
+                callback_ok = True
         except Exception as e:
             logger.error(f"Callback error: {e}")
-            self.formatter.show_callback_status(False, str(e))
+
+        # Calculate duration (from tool_call received to callback complete)
+        duration_s = round(time.time() - start_time, 1)
+
+        # Show result with Rich formatting (include full round-trip timing)
+        self.formatter.show_tool_result(tool, args, result, duration_s)
+        logger.info(f"[LOCAL] Tool result: {result.get('success', 'completed')} in {duration_s}s")
+
+        if not callback_ok:
+            self.formatter.show_callback_status(False, "callback failed")
 
     async def cancel(self) -> bool:
         """Cancel the current task immediately."""

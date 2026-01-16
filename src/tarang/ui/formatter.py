@@ -331,6 +331,7 @@ class OutputFormatter:
     # Descriptive action messages for tools (max 10 chars for alignment)
     TOOL_ACTIONS = {
         "read_file": "Read",
+        "read_files": "Batch",  # Batch read
         "write_file": "Write",
         "edit_file": "Edit",
         "delete_file": "Delete",
@@ -549,6 +550,7 @@ class OutputFormatter:
         tool: str,
         args: Dict[str, Any],
         result: Dict[str, Any],
+        duration_s: Optional[float] = None,
     ) -> None:
         """
         Display the result of a tool execution.
@@ -559,6 +561,7 @@ class OutputFormatter:
             tool: Tool name
             args: Original tool arguments
             result: Tool execution result
+            duration_s: Execution time in seconds (for right-aligned stats)
         """
         icon = self._get_icon(tool)
         color = self._get_color(tool)
@@ -566,25 +569,32 @@ class OutputFormatter:
         # Clear pending tool
         self._pending_tool = None
 
+        # Stats for right side
+        stats = f"[dim]{duration_s}s[/dim]" if duration_s is not None else ""
+
         if "error" in result:
-            self.console.print(f"  [red]✗ {tool}: {result['error'][:60]}[/red]")
+            left = f"  [red]✗ {tool}: {result['error'][:50]}[/red]"
+            if stats:
+                self.console.print(f"{left:<{self.LINE_WIDTH}} {stats}")
+            else:
+                self.console.print(left)
             return
 
         # Compact mode: single-line output for read-only tools
-        if self.compact and tool in ("read_file", "list_files", "search_files", "search_code", "get_file_info"):
-            self._show_compact_result(tool, args, result)
+        if self.compact and tool in ("read_file", "read_files", "list_files", "search_files", "search_code", "get_file_info"):
+            self._show_compact_result(tool, args, result, duration_s)
             return
 
         if tool == "read_file":
             self._show_read_file_result(args, result)
         elif tool == "write_file":
-            self._show_write_file_result(args, result)
+            self._show_write_file_result(args, result, duration_s)
         elif tool == "edit_file":
-            self._show_edit_file_result(args, result)
+            self._show_edit_file_result(args, result, duration_s)
         elif tool == "delete_file":
             self._show_delete_file_result(args, result)
         elif tool == "shell":
-            self._show_shell_result(args, result)
+            self._show_shell_result(args, result, duration_s)
         elif tool == "list_files":
             self._show_list_files_result(args, result)
         elif tool == "search_files":
@@ -592,57 +602,83 @@ class OutputFormatter:
         else:
             # Generic success
             if result.get("success"):
-                self.console.print(f"  [{color}]✓ {tool}: OK[/{color}]")
+                left = f"  [{color}]✓ {tool}: OK[/{color}]"
+                if duration_s is not None:
+                    self.console.print(f"{left:<{self.LINE_WIDTH}} [dim]{duration_s}s[/dim]")
+                else:
+                    self.console.print(left)
             else:
                 self.console.print(f"  [dim]{tool}: completed[/dim]")
 
     # Width for action column alignment (longest: "Validate" = 8)
     ACTION_WIDTH = 8
+    # Width for left part of line (for right-aligned stats)
+    LINE_WIDTH = 55
 
-    def _show_compact_result(self, tool: str, args: Dict[str, Any], result: Dict[str, Any], callback_ok: bool = True) -> None:
+    def _show_compact_result(
+        self,
+        tool: str,
+        args: Dict[str, Any],
+        result: Dict[str, Any],
+        duration_s: Optional[float] = None,
+    ) -> None:
         """Show compact single-line result for read-only tools with aligned columns."""
         icon = self._get_icon(tool)
         color = self._get_color(tool)
         action = self.TOOL_ACTIONS.get(tool, "Done")
         # Pad action to fixed width for alignment
         action_padded = action.ljust(self.ACTION_WIDTH)
-        # Callback indicator on the right
-        cb = " [dim green]✓[/dim green]" if callback_ok else ""
+        # Stats on the right (duration, future: tokens, etc.)
+        stats = f"[dim]{duration_s}s[/dim]" if duration_s is not None else ""
 
         if tool == "read_file":
             file_path = args.get("file_path", "")
             lines = result.get("lines", 0)
             # Truncate long paths
             display_path = file_path if len(file_path) <= 35 else "..." + file_path[-32:]
-            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] {display_path} [dim]({lines} lines)[/dim]{cb}")
+            left = f"  [{color}]✓ {icon} {action_padded}[/{color}] {display_path} [dim]({lines} lines)[/dim]"
+
+        elif tool == "read_files":
+            # Batch read - show count and total lines
+            file_paths = args.get("file_paths", [])
+            successful = result.get("successful", 0)
+            total_lines = result.get("total_lines", 0)
+            left = f"  [{color}]✓ 📚 {action_padded}[/{color}] {successful} files [dim]({total_lines} lines)[/dim]"
 
         elif tool == "list_files":
             path = args.get("path", ".")
             if len(path) > 30:
                 path = "..." + path[-27:]
             count = result.get("count", len(result.get("files", [])))
-            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] {path} [dim]({count} files)[/dim]{cb}")
+            left = f"  [{color}]✓ {icon} {action_padded}[/{color}] {path} [dim]({count} files)[/dim]"
 
         elif tool == "search_files":
             pattern = args.get("pattern", "")[:25]
             count = result.get("count", len(result.get("matches", [])))
-            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] '{pattern}' [dim]({count} matches)[/dim]{cb}")
+            left = f"  [{color}]✓ {icon} {action_padded}[/{color}] '{pattern}' [dim]({count} matches)[/dim]"
 
         elif tool == "search_code":
             query = args.get("query", "")[:25]
             chunks = len(result.get("chunks", []))
-            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] '{query}' [dim]({chunks} chunks)[/dim]{cb}")
+            left = f"  [{color}]✓ {icon} {action_padded}[/{color}] '{query}' [dim]({chunks} chunks)[/dim]"
 
         elif tool == "get_file_info":
             file_path = args.get("file_path", "")
             exists = "exists" if result.get("exists") else "not found"
             display_path = file_path if len(file_path) <= 35 else "..." + file_path[-32:]
-            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}] {display_path} [dim]({exists})[/dim]{cb}")
+            left = f"  [{color}]✓ {icon} {action_padded}[/{color}] {display_path} [dim]({exists})[/dim]"
 
         else:
             action = self.TOOL_ACTIONS.get(tool, tool)
             action_padded = action.ljust(self.ACTION_WIDTH)
-            self.console.print(f"  [{color}]✓ {icon} {action_padded}[/{color}]{cb}")
+            left = f"  [{color}]✓ {icon} {action_padded}[/{color}]"
+
+        # Print with stats right-aligned
+        if stats:
+            # Use Rich's Text for proper alignment with markup
+            self.console.print(f"{left:<{self.LINE_WIDTH}} {stats}")
+        else:
+            self.console.print(left)
 
     def _show_read_file_result(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Display read_file result with line count."""
@@ -663,31 +699,41 @@ class OutputFormatter:
             if lines > 5:
                 self.console.print(f"    [dim]│ ... ({lines - 5} more lines)[/dim]")
 
-    def _show_write_file_result(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
+    def _show_write_file_result(self, args: Dict[str, Any], result: Dict[str, Any], duration_s: Optional[float] = None) -> None:
         """Display write_file result with summary."""
         file_path = args.get("file_path", "")
         content = args.get("content", "")
         lines = content.count("\n") + 1 if content else 0
         display_path = file_path if len(file_path) <= 40 else "..." + file_path[-37:]
+        stats = f"[dim]{duration_s}s[/dim]" if duration_s is not None else ""
 
         if result.get("success"):
             if self.compact:
-                self.console.print(f"  [green]✓ 📝[/green] {display_path} [dim]({lines} lines)[/dim]")
+                left = f"  [green]✓ 📝[/green] {display_path} [dim]({lines} lines)[/dim]"
+                if stats:
+                    self.console.print(f"{left:<{self.LINE_WIDTH}} {stats}")
+                else:
+                    self.console.print(left)
             else:
                 self.console.print(f"  [green]✓ write_file:[/green] {file_path}")
                 self.console.print(f"    [dim]Created {lines} lines[/dim]")
         else:
             self.console.print(f"  [red]✗ write_file:[/red] {file_path} - FAILED")
 
-    def _show_edit_file_result(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
+    def _show_edit_file_result(self, args: Dict[str, Any], result: Dict[str, Any], duration_s: Optional[float] = None) -> None:
         """Display edit_file result with replacement count."""
         file_path = args.get("file_path", "")
         replacements = result.get("replacements", 1)
         display_path = file_path if len(file_path) <= 40 else "..." + file_path[-37:]
+        stats = f"[dim]{duration_s}s[/dim]" if duration_s is not None else ""
 
         if result.get("success"):
             if self.compact:
-                self.console.print(f"  [cyan]✓ ✏️[/cyan]  {display_path} [dim]({replacements} edit{'s' if replacements > 1 else ''})[/dim]")
+                left = f"  [cyan]✓ ✏️[/cyan]  {display_path} [dim]({replacements} edit{'s' if replacements > 1 else ''})[/dim]"
+                if stats:
+                    self.console.print(f"{left:<{self.LINE_WIDTH}} {stats}")
+                else:
+                    self.console.print(left)
             else:
                 self.console.print(f"  [cyan]✓ edit_file:[/cyan] {file_path}")
                 self.console.print(f"    [dim]{replacements} replacement(s) made[/dim]")
@@ -707,26 +753,35 @@ class OutputFormatter:
         else:
             self.console.print(f"  [red]✗ delete_file:[/red] {file_path} - FAILED")
 
-    def _show_shell_result(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
+    def _show_shell_result(self, args: Dict[str, Any], result: Dict[str, Any], duration_s: Optional[float] = None) -> None:
         """Display shell command result with output."""
         command = args.get("command", "")
         exit_code = result.get("exit_code", -1)
         stdout = result.get("stdout", "")
         stderr = result.get("stderr", "")
+        stats = f"[dim]{duration_s}s[/dim]" if duration_s is not None else ""
 
-        # Compact command preview (first 40 chars)
-        cmd_preview = command[:40] + "..." if len(command) > 40 else command
+        # Compact command preview (first 35 chars to leave room for stats)
+        cmd_preview = command[:35] + "..." if len(command) > 35 else command
         cmd_preview = cmd_preview.replace("\n", " ")
 
         # Status line
         if exit_code == 0:
             if self.compact:
-                self.console.print(f"  [green]✓ 💻[/green] {cmd_preview} [dim](exit 0)[/dim]")
+                left = f"  [green]✓ 💻[/green] {cmd_preview} [dim](exit 0)[/dim]"
+                if stats:
+                    self.console.print(f"{left:<{self.LINE_WIDTH}} {stats}")
+                else:
+                    self.console.print(left)
             else:
                 self.console.print(f"  [green]✓ shell:[/green] exit {exit_code}")
         else:
             if self.compact:
-                self.console.print(f"  [yellow]⚠ 💻[/yellow] {cmd_preview} [dim](exit {exit_code})[/dim]")
+                left = f"  [yellow]⚠ 💻[/yellow] {cmd_preview} [dim](exit {exit_code})[/dim]"
+                if stats:
+                    self.console.print(f"{left:<{self.LINE_WIDTH}} {stats}")
+                else:
+                    self.console.print(left)
             else:
                 self.console.print(f"  [yellow]⚠ shell:[/yellow] exit {exit_code}")
 
