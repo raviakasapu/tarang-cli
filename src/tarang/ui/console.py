@@ -109,6 +109,7 @@ class TarangConsole:
   [cyan]/help[/]      Show this help message
   [cyan]/login[/]     Login to Tarang
   [cyan]/config[/]    Configure API key
+  [cyan]/model[/]     Configure LLM models (provider & model selection)
   [cyan]/index[/]     Build code index for better context
   [cyan]/git[/]       Show git status
   [cyan]/files[/]     List tracked files
@@ -121,6 +122,7 @@ class TarangConsole:
   [cyan]/exit[/]      Exit Tarang
 
 [bold]Tips:[/]
+  • Run [cyan]/model[/] to switch providers (OpenRouter, Anthropic, Azure, etc.)
   • Run [cyan]/index[/] to enable smart code retrieval
   • Type your request naturally: "add a login button"
   • Reference files: "fix the bug in src/main.py"

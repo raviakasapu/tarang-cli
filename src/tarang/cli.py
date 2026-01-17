@@ -901,6 +901,31 @@ async def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path)
 
         return True
 
+    if cmd in ("/model", "/models"):
+        from tarang.models import run_model_config, display_current_config, ModelConfig, save_config_to_env
+
+        config = run_model_config(ui.console)
+        if config:
+            # Ask to save
+            if ui.confirm("Save this configuration?", default=True):
+                # Find .env file (check project first, then home)
+                env_path = project_path / ".env"
+                if not env_path.exists():
+                    # Try tarang config dir
+                    config_dir = Path.home() / ".tarang"
+                    config_dir.mkdir(exist_ok=True)
+                    env_path = config_dir / ".env"
+
+                if save_config_to_env(config, env_path):
+                    ui.print_success(f"Configuration saved to {env_path}")
+                    ui.console.print("[dim]Restart the CLI to apply changes.[/dim]")
+                else:
+                    ui.print_error("Failed to save configuration")
+
+                # Show final config
+                display_current_config(ui.console, config)
+        return True
+
     if cmd.startswith("/index"):
         # Parse flags
         force = "--force" in cmd or "-f" in cmd
