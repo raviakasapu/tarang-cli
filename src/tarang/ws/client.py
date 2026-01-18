@@ -23,19 +23,43 @@ logger = logging.getLogger(__name__)
 
 
 class EventType(str, Enum):
-    """WebSocket event types."""
+    """WebSocket event types - aligned with SSE events from stream.py."""
+    # Connection events (WS-specific)
     CONNECTED = "connected"
-    THINKING = "thinking"
-    TOOL_REQUEST = "tool_request"
-    APPROVAL_REQUEST = "approval_request"
-    PHASE_START = "phase_start"
-    MILESTONE_UPDATE = "milestone_update"
-    PROGRESS = "progress"
-    COMPLETE = "complete"
-    ERROR = "error"
-    PAUSED = "paused"
     HEARTBEAT = "heartbeat"
     PONG = "pong"
+
+    # Status/Progress events
+    STATUS = "status"
+    THINKING = "thinking"
+    PROGRESS = "progress"
+    PAUSED = "paused"
+
+    # Tool events - aligned with SSE naming
+    TOOL_CALL = "tool_call"  # Primary name (new)
+    TOOL_REQUEST = "tool_request"  # Legacy alias
+    TOOL_DONE = "tool_done"  # Tool execution completed with timing
+    APPROVAL_REQUEST = "approval_request"  # Separate approval (WS-style)
+
+    # Phase/Worker events - aligned with SSE
+    PLAN = "plan"  # Strategic plan from orchestrator
+    PHASE_START = "phase_start"
+    PHASE_UPDATE = "phase_update"
+    PHASE_SUMMARY = "phase_summary"
+    WORKER_START = "worker_start"
+    WORKER_UPDATE = "worker_update"
+    WORKER_DONE = "worker_done"
+    MILESTONE_UPDATE = "milestone_update"
+    DELEGATION = "delegation"
+
+    # Output events
+    CHANGE = "change"
+    CONTENT = "content"
+
+    # Terminal events
+    COMPLETE = "complete"
+    ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -43,7 +67,13 @@ class WSEvent:
     """A WebSocket event from backend."""
     type: EventType
     data: Dict[str, Any] = field(default_factory=dict)
-    request_id: Optional[str] = None
+    call_id: Optional[str] = None  # Primary (new)
+    request_id: Optional[str] = None  # Legacy alias
+
+    @property
+    def id(self) -> Optional[str]:
+        """Get the event ID (prefers call_id over request_id)."""
+        return self.call_id or self.request_id
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "WSEvent":
@@ -54,10 +84,15 @@ class WSEvent:
         except ValueError:
             etype = EventType.ERROR
 
+        # Support both call_id (new) and request_id (legacy)
+        call_id = data.get("call_id") or data.get("data", {}).get("call_id")
+        request_id = data.get("request_id") or data.get("data", {}).get("request_id")
+
         return cls(
             type=etype,
             data=data.get("data", data),
-            request_id=data.get("request_id"),
+            call_id=call_id,
+            request_id=request_id,
         )
 
 
@@ -353,54 +388,60 @@ class TarangWSClient:
 
     async def send_tool_result(
         self,
-        request_id: str,
+        call_id: str,
         result: Dict[str, Any],
     ):
         """Send tool execution result to backend."""
         if not self._ws or not self._connected:
             raise ConnectionError("Not connected")
 
+        # Send both call_id and request_id for compatibility
         await self._ws.send(json.dumps({
             "type": "tool_result",
-            "request_id": request_id,
+            "call_id": call_id,
+            "request_id": call_id,  # Legacy compatibility
             "result": result,
         }))
 
-        logger.debug(f"Sent tool result for {request_id}")
+        logger.debug(f"Sent tool result for {call_id}")
 
     async def send_tool_error(
         self,
-        request_id: str,
+        call_id: str,
         error: str,
     ):
         """Send tool error to backend."""
         if not self._ws or not self._connected:
             raise ConnectionError("Not connected")
 
+        # Send both call_id and request_id for compatibility
         await self._ws.send(json.dumps({
             "type": "tool_error",
-            "request_id": request_id,
+            "call_id": call_id,
+            "request_id": call_id,  # Legacy compatibility
             "error": error,
         }))
 
-        logger.debug(f"Sent tool error for {request_id}: {error}")
+        logger.debug(f"Sent tool error for {call_id}: {error}")
 
     async def send_approval(
         self,
-        request_id: str,
+        call_id: str,
         approved: bool,
     ):
         """Send approval response to backend."""
         if not self._ws or not self._connected:
             raise ConnectionError("Not connected")
 
+        # Send both call_id and request_id for compatibility
         await self._ws.send(json.dumps({
             "type": "approval",
-            "request_id": request_id,
+            "call_id": call_id,
+            "request_id": call_id,  # Legacy compatibility
             "approved": approved,
         }))
 
-        logger.debug(f"Sent approval for {request_id}: {approved}")
+        logger.debug(f"Sent approval for {call_id}: {approved}")
 
     async def cancel(self):
         """Cancel current execution."""

@@ -59,6 +59,10 @@ class EventType(str, Enum):
     ERROR = "error"
     COMPLETE = "complete"
     CANCELLED = "cancelled"
+    # Pause/Resume events
+    PAUSED = "paused"  # Task paused, waiting for resume
+    RESUMED = "resumed"  # Task resumed
+    PAUSE_INSTRUCTION = "pause_instruction"  # Instruction injected during pause
 
 
 @dataclass
@@ -134,11 +138,14 @@ class LocalToolExecutor:
         project_root: str,
         is_cancelled: Optional[Callable[[], bool]] = None,
         set_process: Optional[Callable[[subprocess.Popen], None]] = None,
+        console: Optional["Console"] = None,
     ):
         self.project_root = Path(project_root).resolve()
         # Optional callbacks for shell interruption
         self._is_cancelled = is_cancelled or (lambda: False)
         self._set_process = set_process or (lambda p: None)
+        # Console for live output (shell streaming)
+        self._console = console
 
     def execute(self, tool: str, args: dict) -> dict:
         """Execute a tool and return the result."""
@@ -623,10 +630,11 @@ class LocalToolExecutor:
             return {"error": str(e), "success": False}
 
     def _shell(self, args: dict) -> dict:
-        """Execute a shell command with interruptibility support."""
+        """Execute a shell command with live output streaming and interruptibility."""
         command = args.get("command", "")
         cwd = args.get("cwd") or "."
         timeout = args.get("timeout", 60)
+        stream_output = args.get("stream_output", True)  # Enable live streaming by default
 
         if not command:
             return {"error": "command required"}
@@ -634,7 +642,7 @@ class LocalToolExecutor:
         working_dir = self.project_root / cwd
 
         try:
-            # Use Popen for interruptibility
+            # Use Popen for interruptibility with line-buffered output
             process = subprocess.Popen(
                 command,
                 shell=True,
@@ -642,15 +650,32 @@ class LocalToolExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,  # Line buffered
             )
 
             # Register process for potential cancellation
             self._set_process(process)
 
-            # Poll with timeout, checking cancellation
             stdout_parts = []
             stderr_parts = []
             start_time = time.time()
+            lines_printed = 0
+            max_live_lines = 20  # Limit live output to prevent flooding
+
+            # Use select for non-blocking reads (Unix) or polling (cross-platform)
+            import select
+            import sys
+
+            # Set stdout/stderr to non-blocking if possible
+            try:
+                import fcntl
+                for pipe in [process.stdout, process.stderr]:
+                    if pipe:
+                        fd = pipe.fileno()
+                        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            except (ImportError, AttributeError):
+                pass  # Windows doesn't support fcntl
 
             while True:
                 # Check if cancelled
@@ -662,15 +687,6 @@ class LocalToolExecutor:
                         process.kill()
                     return {"error": "Cancelled by user", "exit_code": -1, "cancelled": True}
 
-                # Check if process finished
-                retcode = process.poll()
-                if retcode is not None:
-                    # Process finished - read remaining output
-                    stdout, stderr = process.communicate()
-                    stdout_parts.append(stdout)
-                    stderr_parts.append(stderr)
-                    break
-
                 # Check timeout
                 elapsed = time.time() - start_time
                 if elapsed > timeout:
@@ -681,14 +697,53 @@ class LocalToolExecutor:
                         process.kill()
                     return {"error": f"Command timed out after {timeout}s", "exit_code": -1}
 
-                # Wait a bit before next poll
-                time.sleep(0.1)
+                # Try to read available output (non-blocking)
+                try:
+                    # Use select with timeout on Unix
+                    if hasattr(select, 'select') and sys.platform != 'win32':
+                        readable, _, _ = select.select(
+                            [process.stdout, process.stderr], [], [], 0.1
+                        )
+                        for pipe in readable:
+                            line = pipe.readline()
+                            if line:
+                                if pipe == process.stdout:
+                                    stdout_parts.append(line)
+                                    # Stream to console if enabled
+                                    if stream_output and self._console and lines_printed < max_live_lines:
+                                        self._console.print(f"    [dim]{line.rstrip()}[/dim]")
+                                        lines_printed += 1
+                                else:
+                                    stderr_parts.append(line)
+                    else:
+                        # Polling fallback for Windows
+                        time.sleep(0.1)
+                except Exception:
+                    pass
+
+                # Check if process finished
+                retcode = process.poll()
+                if retcode is not None:
+                    # Process finished - read remaining output
+                    remaining_stdout = process.stdout.read() if process.stdout else ""
+                    remaining_stderr = process.stderr.read() if process.stderr else ""
+                    if remaining_stdout:
+                        stdout_parts.append(remaining_stdout)
+                    if remaining_stderr:
+                        stderr_parts.append(remaining_stderr)
+                    break
 
             # Clear process reference
             self._set_process(None)
 
             stdout_full = "".join(stdout_parts)
             stderr_full = "".join(stderr_parts)
+
+            # Show "..." if we truncated live output
+            if stream_output and self._console and lines_printed >= max_live_lines:
+                total_lines = stdout_full.count('\n')
+                if total_lines > max_live_lines:
+                    self._console.print(f"    [dim]... ({total_lines - max_live_lines} more lines)[/dim]")
 
             return {
                 "exit_code": retcode,
@@ -1041,6 +1096,7 @@ class TarangStreamClient:
                 self.project_root,
                 is_cancelled=lambda: self._cancelled,
                 set_process=self._set_shell_process,
+                console=self.console,  # Enable live shell output
             )
             self._execute_tool = self._tool_executor.execute
 
@@ -1323,6 +1379,71 @@ class TarangStreamClient:
             except Exception as e:
                 logger.error(f"Cancel error: {e}")
                 return True  # Still return True since we set the flag
+
+    async def pause(self) -> bool:
+        """
+        Pause the current task.
+
+        The task will pause at the next checkpoint (before next LLM call or tool execution).
+        Use resume() to continue, optionally with an instruction to inject.
+        """
+        if not self.current_task_id:
+            return False
+
+        url = f"{self.base_url}/api/pause/{self.current_task_id}"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {self.token}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("status") in ("paused", "already_paused")
+                return False
+            except Exception as e:
+                logger.error(f"Pause error: {e}")
+                return False
+
+    async def resume(self, instruction: Optional[str] = None) -> bool:
+        """
+        Resume a paused task.
+
+        Args:
+            instruction: Optional instruction to inject (e.g., "skip tests", "use React instead")
+                        The agent will see this instruction and can adjust its behavior.
+
+        Returns:
+            True if resumed successfully
+        """
+        if not self.current_task_id:
+            return False
+
+        url = f"{self.base_url}/api/resume/{self.current_task_id}"
+        payload = {}
+        if instruction:
+            payload["instruction"] = instruction
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                resp = await client.post(
+                    url,
+                    json=payload if payload else None,
+                    headers={"Authorization": f"Bearer {self.token}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("status") == "resumed"
+                return False
+            except Exception as e:
+                logger.error(f"Resume error: {e}")
+                return False
+
+    @property
+    def is_paused(self) -> bool:
+        """Check if the current task is paused (local state only)."""
+        return getattr(self, "_paused", False)
 
 
 # Backward compatibility alias

@@ -488,7 +488,7 @@ async def _run_stream_session(
     - ESC: Cancel current execution
     - SPACE: Pause and add extra instruction
     """
-    from tarang.context_collector import collect_context, ProjectContext
+    from tarang.context_collector import collect_context, collect_context_with_progress, ProjectContext
     from tarang.context import get_retriever, ProjectIndexer
     from tarang.stream import TarangStreamClient, EventType, FileChange
     from tarang.ui.keyboard import KeyboardMonitor, KeyAction, create_keyboard_hints
@@ -519,6 +519,9 @@ async def _run_stream_session(
     if verbose:
         ui.console.print(f"[dim]Backend: {client.base_url}[/dim]")
 
+    # Check for recent sessions (non-blocking hint)
+    await _check_recent_sessions(ui, project_path, creds)
+
     # Print instructions with matching colors
     ui.print_instructions()
 
@@ -546,13 +549,12 @@ async def _run_stream_session(
                 break
 
         # Collect local context (for initial context in request)
-        ui.console.print("[dim]Collecting context...[/dim]")
-
         # Try indexed retrieval first (BM25 + KG)
         retriever = get_retriever(project_path)
         if retriever and retriever.is_ready:
-            # Use smart retrieval
-            result = retriever.retrieve(instruction, hops=1, max_chunks=10)
+            # Use smart retrieval with spinner
+            with ui.console.status("[cyan]Retrieving from index...[/cyan]", spinner="dots"):
+                result = retriever.retrieve(instruction, hops=1, max_chunks=10)
             context = ProjectContext(
                 cwd=str(project_path),
                 files=[],  # Will be populated below
@@ -560,14 +562,13 @@ async def _run_stream_session(
             )
             # Attach indexed context to be sent to backend
             context._indexed_context = result.to_context_dict()
-            if verbose:
-                stats = result.stats
-                ui.console.print(f"[dim]Retrieved {stats.get('total_chunks', 0)} chunks, {stats.get('expanded_symbols', 0)} connected symbols[/dim]")
+            stats = result.stats
+            ui.console.print(f"[dim]✓ Retrieved {stats.get('total_chunks', 0)} chunks, {stats.get('expanded_symbols', 0)} connected[/dim]")
         else:
-            # Fall back to old context collection
-            context = collect_context(str(project_path), instruction)
+            # Fall back to old context collection (with progress bar)
+            context = collect_context_with_progress(str(project_path), instruction, ui.console)
             if verbose:
-                ui.console.print(f"[dim]Found {len(context.files)} files, {len(context.relevant_files)} relevant[/dim]")
+                ui.console.print(f"[dim]✓ Found {len(context.files)} files, {len(context.relevant_files)} relevant[/dim]")
                 ui.console.print("[dim]Tip: Run /index for smarter context retrieval[/dim]")
 
         # Stream execution with tool callbacks
@@ -593,16 +594,30 @@ async def _run_stream_session(
                     break
 
                 elif action == KeyAction.PAUSE:
-                    # Stop monitoring temporarily for clean input
+                    # Pause the backend task and prompt for instruction
                     keyboard.stop()
-                    ui.console.print("\n[bold cyan]━━━ Paused ━━━[/bold cyan]")
+                    ui.console.print("\n[bold cyan]━━━ Pausing... ━━━[/bold cyan]")
+
+                    # Call backend pause endpoint
+                    paused = await client.pause()
+                    if paused:
+                        ui.console.print("[yellow]Task paused.[/yellow] You can add an instruction to adjust the execution.")
+                    else:
+                        ui.console.print("[dim]Pause signal sent (task may continue to checkpoint)[/dim]")
+
                     try:
-                        extra = input("[cyan]Add instruction:[/cyan] ").strip()
+                        extra = input("[cyan]Add instruction (or Enter to continue):[/cyan] ").strip()
                         if extra:
-                            extra_instructions.append(extra)
-                            ui.console.print(f"[green]✓ Queued:[/green] {extra[:50]}...")
+                            ui.console.print(f"[green]✓ Injecting:[/green] {extra[:50]}...")
+                            # Resume with the instruction
+                            await client.resume(extra)
+                        else:
+                            # Resume without instruction
+                            await client.resume()
                     except (KeyboardInterrupt, EOFError):
-                        pass
+                        # Resume without changes on interrupt
+                        await client.resume()
+
                     ui.console.print("[bold cyan]━━━ Resuming ━━━[/bold cyan]\n")
                     keyboard.start()
 
@@ -771,6 +786,23 @@ async def _run_stream_session(
                     content = _extract_content(event.data)
                     ui.print_message(content, title="Answer")
 
+                elif event.type == EventType.PAUSED:
+                    # Backend paused the task
+                    ui.console.print("[bold yellow]⏸ Task paused[/bold yellow]")
+                    msg = event.data.get("message", "")
+                    if msg:
+                        ui.console.print(f"[dim]{msg}[/dim]")
+
+                elif event.type == EventType.RESUMED:
+                    # Backend resumed the task
+                    ui.console.print("[bold green]▶ Task resumed[/bold green]")
+
+                elif event.type == EventType.PAUSE_INSTRUCTION:
+                    # Instruction was injected during pause
+                    injected = event.data.get("instruction", "")
+                    if injected:
+                        ui.console.print(f"[cyan]→ Instruction injected:[/cyan] {injected[:60]}...")
+
                 elif event.type == EventType.ERROR:
                     msg = event.data.get("message", "Unknown error")
                     ui.print_error(msg)
@@ -821,6 +853,115 @@ async def _run_stream_session(
             ui.console.print(f"[cyan]→ Next queued:[/cyan] {instruction[:60]}...")
         else:
             instruction = None
+
+
+async def _check_recent_sessions(ui: TarangConsole, project_path: Path, creds: dict) -> None:
+    """Check for recent sessions and show a hint if found."""
+    from tarang.client import TarangAPIClient
+
+    # Skip if not authenticated
+    if not creds.get("token"):
+        return
+
+    try:
+        client = TarangAPIClient(
+            base_url=creds.get("backend_url") or "https://api.tarang.dev",
+            token=creds.get("token", ""),
+        )
+
+        sessions = await client.get_project_sessions(str(project_path), limit=3)
+
+        if sessions:
+            # Show hint about previous sessions
+            recent_count = len(sessions)
+            last_session = sessions[0]
+            last_instruction = last_session.get("instruction", "")[:40]
+            if len(last_session.get("instruction", "")) > 40:
+                last_instruction += "..."
+
+            ui.console.print(f"[dim]📂 Found {recent_count} previous session(s). Last: \"{last_instruction}\"[/dim]")
+            ui.console.print(f"[dim]   Run [cyan]/sessions[/cyan] to see history.[/dim]")
+            ui.console.print()
+
+    except Exception:
+        # Silently ignore - this is just a hint
+        pass
+
+
+async def _show_project_sessions(ui: TarangConsole, project_path: Path) -> None:
+    """Show previous sessions for this project."""
+    from tarang.client import TarangAuth, TarangAPIClient
+    from datetime import datetime
+
+    auth = TarangAuth()
+    if not auth.is_authenticated():
+        ui.print_warning("Not logged in. Run /login first.")
+        return
+
+    creds = auth.load_credentials() or {}
+    client = TarangAPIClient(
+        base_url=creds.get("backend_url") or "https://api.tarang.dev",
+        token=creds.get("token", ""),
+    )
+
+    ui.console.print("\n[bold]Previous Sessions[/bold]")
+    ui.console.print(f"[dim]Project: {project_path}[/dim]\n")
+
+    try:
+        sessions = await client.get_project_sessions(str(project_path), limit=10)
+
+        if not sessions:
+            ui.console.print("[dim]No previous sessions found for this project.[/dim]")
+            return
+
+        # Display sessions in a table
+        from rich.table import Table
+
+        table = Table(show_header=True, header_style="bold cyan", box=None)
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Date", style="dim", width=12)
+        table.add_column("Instruction", width=50)
+        table.add_column("Status", width=10)
+
+        for i, session in enumerate(sessions, 1):
+            # Format date
+            created_at = session.get("created_at", "")
+            if created_at:
+                try:
+                    dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    date_str = dt.strftime("%b %d %H:%M")
+                except Exception:
+                    date_str = created_at[:10]
+            else:
+                date_str = "Unknown"
+
+            # Format instruction (truncate)
+            instruction = session.get("instruction", "")[:45]
+            if len(session.get("instruction", "")) > 45:
+                instruction += "..."
+
+            # Format status with color
+            status = session.get("status", "unknown")
+            status_colors = {
+                "done": "[green]✓ done[/]",
+                "completed": "[green]✓ done[/]",
+                "failed": "[red]✗ failed[/]",
+                "cancelled": "[yellow]⊘ cancel[/]",
+                "thinking": "[cyan]◌ active[/]",
+                "running": "[cyan]◌ active[/]",
+            }
+            status_display = status_colors.get(status, f"[dim]{status}[/]")
+
+            table.add_row(str(i), date_str, instruction, status_display)
+
+        ui.console.print(table)
+        ui.console.print()
+
+        # Show hint about resume (future feature)
+        ui.console.print("[dim]Session history is stored for reference.[/dim]")
+
+    except Exception as e:
+        ui.print_error(f"Failed to fetch sessions: {e}")
 
 
 async def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path) -> bool:
@@ -924,6 +1065,10 @@ async def _handle_slash_command(ui: TarangConsole, cmd: str, project_path: Path)
 
                 # Show final config
                 display_current_config(ui.console, config)
+        return True
+
+    if cmd in ("/sessions", "/history"):
+        await _show_project_sessions(ui, project_path)
         return True
 
     if cmd.startswith("/index"):

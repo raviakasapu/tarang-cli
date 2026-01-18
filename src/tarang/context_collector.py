@@ -17,7 +17,13 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rich.console import Console
+
+# Type alias for progress callback: (phase: str, current: int, total: int) -> None
+ProgressCallback = Callable[[str, int, int], None]
 
 
 @dataclass
@@ -133,8 +139,14 @@ class ContextCollector:
         "poetry.lock", "Cargo.lock", "composer.lock",
     }
 
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, on_progress: Optional[ProgressCallback] = None):
         self.project_root = Path(project_root).resolve()
+        self.on_progress = on_progress
+
+    def _emit_progress(self, phase: str, current: int, total: int) -> None:
+        """Emit progress update if callback is set."""
+        if self.on_progress:
+            self.on_progress(phase, current, total)
 
     def collect(self, instruction: str) -> ProjectContext:
         """
@@ -146,16 +158,20 @@ class ContextCollector:
         Returns:
             ProjectContext with file list and relevant file contents
         """
-        # Get all files
+        # Phase 1: Scan files
+        self._emit_progress("Scanning files", 0, 4)
         all_files = self._scan_files()
 
-        # Build folder structure tree (helps LLM understand project layout)
+        # Phase 2: Build folder tree
+        self._emit_progress("Building tree", 1, 4)
         folder_tree = self._build_folder_tree(all_files)
 
-        # ALWAYS include project identity files first (reduces tool calls!)
+        # Phase 3: Collect identity files
+        self._emit_progress("Reading configs", 2, 4)
         identity_files = self._collect_identity_files()
 
-        # Find relevant files based on instruction
+        # Phase 4: Find relevant files
+        self._emit_progress("Finding relevant", 3, 4)
         relevant_paths = self._find_relevant_files(instruction, all_files)
 
         # For small projects, include all files if we didn't find specific matches
@@ -167,7 +183,7 @@ class ContextCollector:
         # (avoiding duplicates)
         identity_paths = {f.path for f in identity_files}
         additional_files = []
-        for path in relevant_paths:
+        for i, path in enumerate(relevant_paths):
             if path not in identity_paths:
                 content = self._read_file(path)
                 if content:
@@ -176,6 +192,9 @@ class ContextCollector:
                         break
 
         relevant_files = identity_files + additional_files
+
+        # Done
+        self._emit_progress("Complete", 4, 4)
 
         context = ProjectContext(
             cwd=str(self.project_root),
@@ -434,16 +453,56 @@ class ContextCollector:
             return None
 
 
-def collect_context(project_root: str, instruction: str) -> ProjectContext:
+def collect_context(
+    project_root: str,
+    instruction: str,
+    on_progress: Optional[ProgressCallback] = None,
+) -> ProjectContext:
     """
     Convenience function to collect context.
 
     Args:
         project_root: Path to project
         instruction: User instruction
+        on_progress: Optional callback for progress updates
 
     Returns:
         ProjectContext
     """
-    collector = ContextCollector(project_root)
+    collector = ContextCollector(project_root, on_progress=on_progress)
     return collector.collect(instruction)
+
+
+def collect_context_with_progress(
+    project_root: str,
+    instruction: str,
+    console: "Console",
+) -> ProjectContext:
+    """
+    Collect context with Rich progress bar display.
+
+    Args:
+        project_root: Path to project
+        instruction: User instruction
+        console: Rich Console instance
+
+    Returns:
+        ProjectContext
+    """
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[cyan]{task.description}[/cyan]"),
+        BarColumn(bar_width=20),
+        TextColumn("[dim]{task.fields[status]}[/dim]"),
+        console=console,
+        transient=True,  # Remove progress bar when done
+    ) as progress:
+        task = progress.add_task("Collecting context", total=4, status="Starting...")
+
+        def on_progress(phase: str, current: int, total: int):
+            progress.update(task, completed=current, status=phase)
+
+        collector = ContextCollector(project_root, on_progress=on_progress)
+        return collector.collect(instruction)

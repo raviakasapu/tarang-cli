@@ -7,10 +7,14 @@ Handles different event types from the backend:
 - Completion and errors
 
 Integrates with Rich console for beautiful output.
+
+NOTE: Event types are aligned with SSE implementation (stream.py).
+Both transports use the same event schema for browser/CLI compatibility.
 """
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -40,6 +44,10 @@ class ExecutionState:
     error: Optional[str] = None
     job_id: Optional[str] = None
     thinking_message: str = ""
+    # Timing tracking (aligned with SSE)
+    tool_start_times: Dict[str, float] = field(default_factory=dict)
+    total_tool_time: float = 0.0
+    strategic_plan: Optional[str] = None
 
 
 # Type for approval UI callback
@@ -240,16 +248,28 @@ class MessageHandlers:
         return True
 
     async def _handle_tool_request(self, event: WSEvent, ws_client) -> bool:
-        """Handle tool execution request from backend."""
-        request_id = event.request_id or event.data.get("request_id", "")
+        """Handle tool execution request from backend (legacy name)."""
+        return await self._handle_tool_call(event, ws_client)
+
+    async def _handle_tool_call(self, event: WSEvent, ws_client) -> bool:
+        """Handle tool execution request from backend (aligned with SSE)."""
+        # Support both call_id (new) and request_id (legacy)
+        call_id = event.id or event.data.get("call_id") or event.data.get("request_id", "")
         tool = event.data.get("tool", "")
         args = event.data.get("args", {})
+        require_approval = event.data.get("require_approval", False)
+
+        # Track timing (aligned with SSE pattern)
+        start_time = time.time()
+        self.state.tool_start_times[call_id] = start_time
 
         # Show tool call with icon
         tool_icons = {
             "read_file": "",
+            "read_files": "",
             "list_files": "",
             "search_files": "",
+            "search_code": "",
             "write_file": "",
             "edit_file": "",
             "delete_file": "",
@@ -261,12 +281,16 @@ class MessageHandlers:
         # Build display info
         if tool == "read_file":
             display = f"{args.get('file_path', '')}"
+        elif tool == "read_files":
+            paths = args.get('file_paths', [])
+            display = f"{len(paths)} files"
         elif tool == "list_files":
             path = args.get('path', '.')
             pattern = args.get('pattern', '')
             display = f"{path}" + (f" ({pattern})" if pattern else "")
-        elif tool == "search_files":
-            display = f"'{args.get('pattern', '')}'"
+        elif tool in ("search_files", "search_code"):
+            query = args.get('pattern', '') or args.get('query', '')
+            display = f"'{query}'"
         elif tool == "write_file":
             display = f"{args.get('file_path', '')}"
         elif tool == "edit_file":
@@ -283,8 +307,12 @@ class MessageHandlers:
             # Execute tool locally
             result = await self.executor.execute(tool, args)
 
+            # Calculate duration
+            duration_s = round(time.time() - start_time, 1)
+            self.state.total_tool_time += duration_s
+
             # Send result back
-            await ws_client.send_tool_result(request_id, result)
+            await ws_client.send_tool_result(call_id, result)
 
             # Track file changes
             if tool in ("write_file", "edit_file") and result.get("success"):
@@ -292,30 +320,58 @@ class MessageHandlers:
                 if file_path and file_path not in self.state.files_changed:
                     self.state.files_changed.append(file_path)
 
-            # Show result summary for verbose mode
-            if self.verbose:
-                if result.get("error"):
-                    self.console.print(f"    [red]Error: {result['error']}[/red]")
-                elif tool == "read_file":
-                    lines = result.get("lines_returned", 0)
-                    self.console.print(f"    [dim]Read {lines} lines[/dim]")
-                elif tool == "list_files":
-                    count = len(result.get("files", []))
-                    self.console.print(f"    [dim]Found {count} files[/dim]")
-                elif tool == "search_files":
-                    count = result.get("total_matches", 0)
-                    self.console.print(f"    [dim]Found {count} matches[/dim]")
+            # Show result summary with timing (aligned with SSE formatter)
+            if result.get("error"):
+                self.console.print(f"    [red]✗ {result['error']}[/red]  [dim]{duration_s}s[/dim]")
+            elif tool == "read_file":
+                lines = result.get("lines", result.get("lines_returned", 0))
+                self.console.print(f"    [dim]✓ {lines} lines[/dim]  [dim]{duration_s}s[/dim]")
+            elif tool == "read_files":
+                count = result.get("successful", 0)
+                self.console.print(f"    [dim]✓ {count} files read[/dim]  [dim]{duration_s}s[/dim]")
+            elif tool == "list_files":
+                count = len(result.get("files", []))
+                self.console.print(f"    [dim]✓ {count} files[/dim]  [dim]{duration_s}s[/dim]")
+            elif tool in ("search_files", "search_code"):
+                count = result.get("total_matches", len(result.get("matches", result.get("chunks", []))))
+                self.console.print(f"    [dim]✓ {count} matches[/dim]  [dim]{duration_s}s[/dim]")
+            elif tool in ("write_file", "edit_file"):
+                self.console.print(f"    [green]✓ Applied[/green]  [dim]{duration_s}s[/dim]")
+            elif tool == "shell":
+                exit_code = result.get("exit_code", 0)
+                status = "[green]✓[/green]" if exit_code == 0 else f"[yellow]exit {exit_code}[/yellow]"
+                self.console.print(f"    {status}  [dim]{duration_s}s[/dim]")
+            elif self.verbose:
+                self.console.print(f"    [dim]✓ Done[/dim]  [dim]{duration_s}s[/dim]")
 
         except Exception as e:
+            duration_s = round(time.time() - start_time, 1)
             logger.exception(f"Tool execution error: {tool}")
-            self.console.print(f"    [red]Error: {e}[/red]")
-            await ws_client.send_tool_error(request_id, str(e))
+            self.console.print(f"    [red]✗ {e}[/red]  [dim]{duration_s}s[/dim]")
+            await ws_client.send_tool_error(call_id, str(e))
+
+        return True
+
+    async def _handle_tool_done(self, event: WSEvent, ws_client) -> bool:
+        """Handle tool_done event from backend (timing info)."""
+        call_id = event.id or event.data.get("call_id", "")
+        duration_s = event.data.get("duration_s", 0)
+        tool = event.data.get("tool", "")
+
+        # Clean up timing tracking
+        if call_id in self.state.tool_start_times:
+            del self.state.tool_start_times[call_id]
+
+        # Verbose logging only - main timing is shown in _handle_tool_call
+        if self.verbose:
+            logger.debug(f"Tool {tool} completed in {duration_s}s")
 
         return True
 
     async def _handle_approval_request(self, event: WSEvent, ws_client) -> bool:
         """Handle approval request for destructive operations."""
-        request_id = event.request_id or event.data.get("request_id", "")
+        # Support both call_id (new) and request_id (legacy)
+        call_id = event.id or event.data.get("call_id") or event.data.get("request_id", "")
         tool = event.data.get("tool", "")
         args = event.data.get("args", {})
         description = event.data.get("description", "")
@@ -336,24 +392,30 @@ class MessageHandlers:
             approved = response in ("y", "yes")
 
         if approved:
+            # Track timing
+            start_time = time.time()
+
             # Execute and send result
             try:
                 result = await self.executor.execute(tool, args)
-                await ws_client.send_tool_result(request_id, result)
+                duration_s = round(time.time() - start_time, 1)
+                self.state.total_tool_time += duration_s
+
+                await ws_client.send_tool_result(call_id, result)
 
                 # Track file changes
                 if tool in ("write_file", "edit_file") and result.get("success"):
                     file_path = result.get("file_path", args.get("file_path", ""))
                     if file_path and file_path not in self.state.files_changed:
                         self.state.files_changed.append(file_path)
-                        self.console.print(f"  [green] Applied: {file_path}[/green]")
+                        self.console.print(f"  [green]✓ Applied: {file_path}[/green]  [dim]{duration_s}s[/dim]")
 
             except Exception as e:
-                await ws_client.send_tool_error(request_id, str(e))
+                await ws_client.send_tool_error(call_id, str(e))
         else:
             # Send rejection
-            await ws_client.send_approval(request_id, False)
-            self.console.print("  [yellow] Skipped[/yellow]")
+            await ws_client.send_approval(call_id, False)
+            self.console.print("  [yellow]⊘ Skipped[/yellow]")
 
         return True
 
@@ -507,19 +569,169 @@ class MessageHandlers:
                 self.console.print(f"[bold]│[/bold]  [dim]{description}[/dim]")
             self.console.print(f"[bold]╰─[/bold]")
 
+    async def _handle_plan(self, event: WSEvent, ws_client) -> bool:
+        """Handle strategic plan from orchestrator."""
+        plan = event.data.get("plan", "")
+        phases = event.data.get("phases", [])
+
+        self.state.strategic_plan = plan
+        self.state.total_phases = len(phases)
+
+        if self.verbose:
+            self.console.print()
+            self.console.print(
+                Panel(
+                    f"[cyan]{plan}[/cyan]",
+                    title="[bold blue] Strategic Plan[/bold blue]",
+                    border_style="blue",
+                )
+            )
+            if phases:
+                for i, phase in enumerate(phases, 1):
+                    self.console.print(f"  {i}. {phase}")
+
+        return True
+
+    async def _handle_phase_update(self, event: WSEvent, ws_client) -> bool:
+        """Handle phase status update (no re-render)."""
+        phase = event.data.get("phase", 0)
+        status = event.data.get("status", "")
+        name = event.data.get("name", "")
+
+        self.state.current_phase = phase
+        self.state.phase_name = name
+
+        if self.verbose:
+            self.console.print(f"  [dim]Phase {phase}: {name} - {status}[/dim]")
+
+        return True
+
+    async def _handle_phase_summary(self, event: WSEvent, ws_client) -> bool:
+        """Handle phase summary (display immediately)."""
+        phase = event.data.get("phase", 0)
+        summary = event.data.get("summary", "")
+        files = event.data.get("files_changed", [])
+
+        self.console.print()
+        self.console.print(f"[bold blue]Phase {phase} Complete[/bold blue]")
+        if summary:
+            self.console.print(f"  {summary}")
+        if files:
+            self.console.print(f"  [dim]Files: {', '.join(files[:5])}{'...' if len(files) > 5 else ''}[/dim]")
+
+        return True
+
+    async def _handle_worker_start(self, event: WSEvent, ws_client) -> bool:
+        """Handle worker starting."""
+        worker = event.data.get("worker", "")
+        task = event.data.get("task", "")
+
+        if self.verbose:
+            self.console.print(f"  [dim cyan]→ {worker}:[/dim cyan] {task}")
+
+        return True
+
+    async def _handle_worker_update(self, event: WSEvent, ws_client) -> bool:
+        """Handle worker status update."""
+        worker = event.data.get("worker", "")
+        status = event.data.get("status", "")
+        message = event.data.get("message", "")
+
+        if self.verbose:
+            self.console.print(f"  [dim]  {worker}: {status} - {message}[/dim]")
+
+        return True
+
+    async def _handle_worker_done(self, event: WSEvent, ws_client) -> bool:
+        """Handle worker completed."""
+        worker = event.data.get("worker", "")
+        result = event.data.get("result", "")
+
+        if self.verbose:
+            self.console.print(f"  [dim green]✓ {worker}[/dim green]")
+
+        return True
+
+    async def _handle_delegation(self, event: WSEvent, ws_client) -> bool:
+        """Handle agent delegation event."""
+        from_agent = event.data.get("from", "")
+        to_agent = event.data.get("to", "")
+        task = event.data.get("task", "")
+
+        if self.verbose:
+            self.console.print(f"  [dim]↳ {from_agent} → {to_agent}: {task}[/dim]")
+
+        return True
+
+    async def _handle_change(self, event: WSEvent, ws_client) -> bool:
+        """Handle file change event."""
+        change_type = event.data.get("type", "")
+        path = event.data.get("path", "")
+
+        if path and path not in self.state.files_changed:
+            self.state.files_changed.append(path)
+
+        icon = "+" if change_type == "create" else "~"
+        color = "green" if change_type == "create" else "yellow"
+        self.console.print(f"  [{color}]{icon} {path}[/{color}]")
+
+        return True
+
+    async def _handle_content(self, event: WSEvent, ws_client) -> bool:
+        """Handle content/text output event."""
+        content = event.data.get("content", "")
+        if content:
+            self.console.print(content)
+        return True
+
+    async def _handle_status(self, event: WSEvent, ws_client) -> bool:
+        """Handle status message event."""
+        message = event.data.get("message", "")
+        if message:
+            self.console.print(f"[dim]{message}[/dim]")
+        return True
+
+    async def _handle_cancelled(self, event: WSEvent, ws_client) -> bool:
+        """Handle cancellation event."""
+        message = event.data.get("message", "Cancelled by user")
+
+        self.console.print()
+        self.console.print(
+            Panel(
+                f"[yellow]{message}[/yellow]",
+                title="[bold yellow] Cancelled[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+
+        return False  # Stop iteration
+
     async def _handle_complete(self, event: WSEvent, ws_client) -> bool:
         """Handle execution completed."""
         summary = event.data.get("summary", "Completed")
         files = event.data.get("files_changed", [])
         phases = event.data.get("phases_completed", 0)
         milestones = event.data.get("milestones_completed", 0)
+        duration_s = event.data.get("duration_s", 0)
+
+        # Use tracked files if not provided
+        if not files:
+            files = self.state.files_changed
+
+        # Format timing
+        timing_str = ""
+        if duration_s:
+            timing_str = f"\n[dim]Total time: {duration_s}s[/dim]"
+        elif self.state.total_tool_time:
+            timing_str = f"\n[dim]Tool time: {self.state.total_tool_time:.1f}s[/dim]"
 
         self.console.print()
         self.console.print(
             Panel(
                 f"[green]{summary}[/green]\n\n"
                 f"[dim]Files changed: {len(files)}[/dim]\n"
-                f"[dim]Phases: {phases} | Milestones: {milestones}[/dim]",
+                f"[dim]Phases: {phases} | Milestones: {milestones}[/dim]"
+                f"{timing_str}",
                 title="[bold green] Complete[/bold green]",
                 border_style="green",
             )

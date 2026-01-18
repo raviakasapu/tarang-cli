@@ -458,6 +458,149 @@ class TarangAPIClient:
         except Exception:
             return False
 
+    async def get_project_sessions(
+        self,
+        project_path: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get recent sessions for a project.
+
+        Args:
+            project_path: Path to the project
+            limit: Max number of sessions to return
+
+        Returns:
+            List of session dictionaries
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self.base_url}/v2/sessions",
+                    params={"project_path": project_path, "limit": limit},
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception:
+            return []
+
+    async def get_session_events(
+        self,
+        session_id: str,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get events for a session (for resume/history).
+
+        Args:
+            session_id: Session ID
+            limit: Max events to return
+
+        Returns:
+            List of event dictionaries
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self.base_url}/v2/sessions/{session_id}/events",
+                    params={"limit": limit},
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception:
+            return []
+
+    # ==========================================
+    # TASK PAUSE/RESUME
+    # ==========================================
+
+    async def pause_task(self, task_id: str) -> Dict[str, Any]:
+        """
+        Pause a running task.
+
+        The task will pause at the next checkpoint (before next LLM call or tool execution).
+        Use resume_task() to continue.
+
+        Args:
+            task_id: Task ID to pause
+
+        Returns:
+            Status dict with 'status' key ('paused', 'already_paused', or error)
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.base_url}/v3/pause/{task_id}",
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPStatusError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def resume_task(
+        self,
+        task_id: str,
+        instruction: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Resume a paused task.
+
+        Optionally provide an instruction that will be injected into the task context.
+        The agent will see this instruction and can adjust its behavior accordingly.
+
+        Args:
+            task_id: Task ID to resume
+            instruction: Optional instruction to inject (e.g., "skip tests", "use React instead")
+
+        Returns:
+            Status dict with 'status' key ('resumed', 'not_paused', or error)
+        """
+        payload = {}
+        if instruction:
+            payload["instruction"] = instruction
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.base_url}/v3/resume/{task_id}",
+                    json=payload if payload else None,
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPStatusError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def cancel_task(self, task_id: str) -> Dict[str, Any]:
+        """
+        Cancel a running task.
+
+        Args:
+            task_id: Task ID to cancel
+
+        Returns:
+            Status dict
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.base_url}/v3/cancel/{task_id}",
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPStatusError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
 
 def collect_relevant_files(
     project_path: Path,

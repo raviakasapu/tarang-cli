@@ -89,7 +89,7 @@ class TarangConsole:
     def print_instructions(self):
         """Print usage instructions with matching colors."""
         self.console.print("[green]Type your instructions[/], or [cyan]/help[/] for commands")
-        self.console.print("[bold]↑/↓[/][dim]=[/]history  [bold]ESC[/][green]=[/]cancel  [bold]SPACE[/][cyan]=[/]add instruction")
+        self.console.print("[bold]↑/↓[/][dim]=[/]history  [bold]ESC[/][green]=[/]cancel  [bold]SPACE[/][cyan]=[/]pause & inject")
         self.console.print()
 
     def print_project_stats(self, total_files: int, total_lines: int):
@@ -111,6 +111,7 @@ class TarangConsole:
   [cyan]/config[/]    Configure API key
   [cyan]/model[/]     Configure LLM models (provider & model selection)
   [cyan]/index[/]     Build code index for better context
+  [cyan]/sessions[/]  Show previous sessions for this project
   [cyan]/git[/]       Show git status
   [cyan]/files[/]     List tracked files
   [cyan]/add[/]       Add files to context
@@ -124,6 +125,7 @@ class TarangConsole:
 [bold]Tips:[/]
   • Run [cyan]/model[/] to switch providers (OpenRouter, Anthropic, Azure, etc.)
   • Run [cyan]/index[/] to enable smart code retrieval
+  • Run [cyan]/sessions[/] to see previous work on this project
   • Type your request naturally: "add a login button"
   • Reference files: "fix the bug in src/main.py"
   • Ask questions: "explain how auth works"
