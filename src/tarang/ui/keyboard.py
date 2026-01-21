@@ -150,9 +150,25 @@ class KeyboardMonitor:
                 if select.select([sys.stdin], [], [], 0.1)[0]:
                     char = sys.stdin.read(1)
 
-                    if char == '\x1b':  # ESC
-                        self.state.set_cancel()
-                        self.on_status("[yellow]ESC pressed - cancelling...[/yellow]")
+                    if char == '\x1b':  # ESC or start of escape sequence
+                        # Check if more characters follow (arrow keys, etc.)
+                        # Arrow keys send: ESC [ A/B/C/D
+                        # Give a short timeout to check for sequence
+                        if select.select([sys.stdin], [], [], 0.05)[0]:
+                            # More characters available - this is an escape sequence
+                            next_char = sys.stdin.read(1)
+                            if next_char == '[':
+                                # Arrow key or other CSI sequence - read the final char
+                                if select.select([sys.stdin], [], [], 0.05)[0]:
+                                    sys.stdin.read(1)  # Consume A/B/C/D
+                                # Ignore arrow keys - don't trigger any action
+                                continue
+                            # Other escape sequence - ignore
+                            continue
+                        else:
+                            # Standalone ESC - trigger cancel
+                            self.state.set_cancel()
+                            self.on_status("[yellow]ESC pressed - cancelling...[/yellow]")
 
                     elif char == ' ':  # SPACE
                         self.state.set_pause()

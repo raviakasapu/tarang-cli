@@ -544,6 +544,12 @@ async def _run_stream_session(
                     ui.print_goodbye()
                     break
 
+                # Handle "continue" - resume from previous session
+                if instruction.lower() in ("continue", "cont", "resume"):
+                    instruction = await _handle_continue(ui, project_path, creds, instruction)
+                    if not instruction:
+                        continue  # User cancelled or no session found
+
             except (KeyboardInterrupt, EOFError):
                 ui.print_goodbye()
                 break
@@ -621,7 +627,15 @@ async def _run_stream_session(
                     ui.console.print("[bold cyan]━━━ Resuming ━━━[/bold cyan]\n")
                     keyboard.start()
 
-                if event.type == EventType.STATUS:
+                if event.type == EventType.SESSION_INFO:
+                    # Display session tracking info
+                    session_id = event.data.get("session_id", "")[:12]
+                    job_id = event.data.get("job_id", "")
+                    task_id = event.data.get("task_id", "")
+                    config = event.data.get("config", "")
+                    ui.console.print(f"[dim]Session: {session_id} | Job: {job_id} | → {config}[/dim]")
+
+                elif event.type == EventType.STATUS:
                     msg = event.data.get("message", "Working...")
                     phase = event.data.get("phase", "")
                     worker = event.data.get("worker", "")
@@ -853,6 +867,140 @@ async def _run_stream_session(
             ui.console.print(f"[cyan]→ Next queued:[/cyan] {instruction[:60]}...")
         else:
             instruction = None
+
+
+async def _handle_continue(ui: TarangConsole, project_path: Path, creds: dict, instruction: str) -> Optional[str]:
+    """
+    Handle 'continue' command - pull previous session and format resume instruction.
+
+    Returns:
+        Modified instruction with context, or None if cancelled/no session
+    """
+    from tarang.client import TarangAPIClient
+
+    if not creds.get("token"):
+        ui.print_warning("Not logged in. Cannot fetch previous session.")
+        return None
+
+    try:
+        client = TarangAPIClient(
+            base_url=creds.get("backend_url") or "https://api.tarang.dev",
+            token=creds.get("token", ""),
+        )
+
+        # Get recent sessions for this project
+        sessions = await client.get_project_sessions(str(project_path), limit=5)
+
+        if not sessions:
+            ui.print_info("No previous sessions found for this project.")
+            return None
+
+        # Show sessions for user to pick
+        from rich.table import Table
+        from datetime import datetime
+
+        ui.console.print("\n[bold]Recent Sessions:[/bold]")
+        table = Table(show_header=True, header_style="bold cyan", box=None)
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Time", style="dim", width=14)
+        table.add_column("Instruction", width=50)
+        table.add_column("Status", width=10)
+
+        for i, session in enumerate(sessions, 1):
+            created_at = session.get("created_at", "")
+            if created_at:
+                try:
+                    dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    time_str = dt.strftime("%b %d %H:%M")
+                except Exception:
+                    time_str = created_at[:10]
+            else:
+                time_str = "Unknown"
+
+            instr = session.get("instruction", "")[:45]
+            if len(session.get("instruction", "")) > 45:
+                instr += "..."
+
+            status = session.get("status", "unknown")
+            status_map = {
+                "done": "[green]✓ done[/]",
+                "completed": "[green]✓ done[/]",
+                "failed": "[red]✗ failed[/]",
+                "cancelled": "[yellow]⊘ cancel[/]",
+                "thinking": "[cyan]◌ active[/]",
+            }
+            status_display = status_map.get(status, f"[dim]{status}[/]")
+
+            table.add_row(str(i), time_str, instr, status_display)
+
+        ui.console.print(table)
+        ui.console.print()
+
+        # Ask user which session to continue
+        from rich.prompt import Prompt
+        choice = Prompt.ask(
+            "[cyan]Continue session #[/]",
+            default="1",
+            console=ui.console,
+        )
+
+        try:
+            idx = int(choice) - 1
+            if idx < 0 or idx >= len(sessions):
+                ui.print_error("Invalid selection")
+                return None
+        except ValueError:
+            ui.print_error("Invalid selection")
+            return None
+
+        selected = sessions[idx]
+        original_instruction = selected.get("instruction", "")
+        session_id = selected.get("id", "")
+
+        # Fetch session events for context
+        events = await client.get_session_events(session_id, limit=50)
+
+        # Build context from events
+        context_parts = []
+        for event in events:
+            event_type = event.get("type", "")
+            content = event.get("content", "")
+            if event_type == "thought" and content:
+                context_parts.append(f"[Thought] {content[:200]}")
+            elif event_type == "action" and content:
+                context_parts.append(f"[Action] {content[:100]}")
+            elif event_type == "result" and content:
+                context_parts.append(f"[Result] {content[:150]}")
+
+        # Format resume instruction
+        ui.console.print(f"\n[green]Resuming:[/green] {original_instruction[:60]}...")
+
+        if context_parts:
+            context_summary = "\n".join(context_parts[-10:])  # Last 10 events
+            resume_instruction = f"""CONTINUE PREVIOUS TASK:
+
+Original instruction: {original_instruction}
+
+Previous progress:
+{context_summary}
+
+User says: continue
+
+Please review what was done and continue from where we left off. If the task was incomplete, finish it. If there were errors, fix them."""
+        else:
+            resume_instruction = f"""CONTINUE PREVIOUS TASK:
+
+Original instruction: {original_instruction}
+
+User says: continue
+
+Please continue from where we left off. Check the current state of the project and proceed with the implementation."""
+
+        return resume_instruction
+
+    except Exception as e:
+        ui.print_error(f"Failed to fetch session: {e}")
+        return None
 
 
 async def _check_recent_sessions(ui: TarangConsole, project_path: Path, creds: dict) -> None:

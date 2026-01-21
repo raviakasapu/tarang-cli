@@ -6,6 +6,7 @@ Provides:
 - BM25 keyword search
 - Symbol Graph (Code Knowledge Graph)
 - Graph-augmented retrieval
+- KB Documentation loading
 """
 
 from tarang.context.skeleton import SkeletonGenerator, ProjectSkeleton
@@ -14,6 +15,7 @@ from tarang.context.bm25 import BM25Index, SearchResult
 from tarang.context.graph import SymbolGraph, SymbolNode
 from tarang.context.retriever import ContextRetriever, RetrievalResult, create_retriever
 from tarang.context.indexer import ProjectIndexer, IndexStats, index_project, get_retriever
+from tarang.context.doc_loader import KBDocLoader, KBDoc, KBDocSection
 
 __all__ = [
     # Skeleton (existing)
@@ -38,4 +40,8 @@ __all__ = [
     "IndexStats",
     "index_project",
     "get_retriever",
+    # KB Docs
+    "KBDocLoader",
+    "KBDoc",
+    "KBDocSection",
 ]

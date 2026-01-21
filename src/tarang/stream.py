@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 class EventType(str, Enum):
     """SSE event types from backend."""
     STATUS = "status"
+    SESSION_INFO = "session_info"  # Session/job/task IDs for tracking
     TOOL_REQUEST = "tool_request"  # Legacy name
     TOOL_CALL = "tool_call"  # New name (SSE Split Architecture)
     TOOL_DONE = "tool_done"
@@ -418,23 +419,30 @@ class LocalToolExecutor:
     _index_result = None
 
     def _search_code(self, args: dict) -> dict:
-        """Search codebase using BM25 + Knowledge Graph retriever."""
+        """Search codebase using BM25 + Knowledge Graph + KB Docs retriever."""
         query = args.get("query", "")
         hops = args.get("hops", 1)
         max_chunks = args.get("max_chunks", 10)
+        include_kb_docs = args.get("include_kb_docs", True)
 
         if not query:
             return {"error": "query required"}
 
         try:
             # Construct the correct index path (.tarang/index/)
-            index_path = Path(self.project_root) / ".tarang" / "index"
-            retriever = create_retriever(index_path)
+            project_path = Path(self.project_root)
+            index_path = project_path / ".tarang" / "index"
+            retriever = create_retriever(index_path, project_root=project_path)
             if retriever is None:
                 # Index not found - start background indexing
                 return self._handle_missing_index(query)
 
-            result = retriever.retrieve(query=query, hops=hops, max_chunks=max_chunks)
+            result = retriever.retrieve(
+                query=query,
+                hops=hops,
+                max_chunks=max_chunks,
+                include_kb_docs=include_kb_docs,
+            )
 
             # Format chunks for response (result is a RetrievalResult dataclass)
             chunks = []
@@ -449,12 +457,25 @@ class LocalToolExecutor:
                     "signature": chunk.signature or "",
                 })
 
+            # Format KB docs
+            kb_docs = []
+            for doc in result.kb_docs:
+                kb_docs.append({
+                    "id": doc.id,
+                    "title": doc.title,
+                    "summary": doc.summary,
+                    "tags": doc.tags,
+                })
+
             return {
                 "success": True,
                 "chunks": chunks,
                 "signatures": result.signatures,
                 "graph": result.graph_context,
+                "kb_docs": kb_docs,
+                "kb_context": result.kb_context,
                 "indexed": True,
+                "stats": result.stats,
             }
         except Exception as e:
             logger.exception("search_code error")
