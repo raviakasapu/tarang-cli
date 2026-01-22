@@ -44,6 +44,128 @@ class ToolExecutor:
     # Shell command timeout (seconds)
     SHELL_TIMEOUT = 60
 
+    # Auto-lint timeout (seconds)
+    LINT_TIMEOUT = 30
+
+    # File extension to lint command mapping
+    LINT_COMMANDS = {
+        # JavaScript/TypeScript
+        ".js": "npx eslint --no-error-on-unmatched-pattern {file}",
+        ".jsx": "npx eslint --no-error-on-unmatched-pattern {file}",
+        ".ts": "npx eslint --no-error-on-unmatched-pattern {file}",
+        ".tsx": "npx eslint --no-error-on-unmatched-pattern {file}",
+        ".mjs": "npx eslint --no-error-on-unmatched-pattern {file}",
+        # Python
+        ".py": "python -m py_compile {file}",
+        # Go
+        ".go": "go vet {file}",
+        # Rust
+        ".rs": "rustfmt --check {file}",
+    }
+
+    # Project type detection (config file -> project type)
+    PROJECT_MARKERS = {
+        "package.json": "node",
+        "pyproject.toml": "python",
+        "requirements.txt": "python",
+        "Cargo.toml": "rust",
+        "go.mod": "go",
+    }
+
+    # =========================================================================
+    # Smart Tool Output Handling
+    # =========================================================================
+
+    # Tool output profiles: different limits and filtering per tool/command type
+    TOOL_OUTPUT_PROFILES = {
+        "shell": {
+            # Install commands - mostly noise
+            "install": {
+                "patterns": ["pip install", "npm install", "yarn add", "cargo add", "go get"],
+                "success_limit": 500,
+                "failure_limit": 2000,
+                "noise_patterns": [
+                    r"Collecting \S+",
+                    r"Downloading \S+",
+                    r"Installing collected",
+                    r"Successfully installed",
+                    r"━+",  # Progress bars
+                    r"[\s]*\d+%[\s]*\|",  # Percentage bars
+                    r"Using cached",
+                    r"Requirement already satisfied",
+                    r"added \d+ packages",
+                    r"up to date",
+                    r"npm WARN",
+                ],
+                "keep_patterns": ["error", "Error", "ERROR", "failed", "Failed", "FAILED", "warning:", "Warning:"],
+            },
+            # Run/execute commands - useful output
+            "run": {
+                "patterns": ["python ", "node ", "go run", "cargo run", "npm start", "npm run dev"],
+                "success_limit": 4000,
+                "failure_limit": 8000,
+                "noise_patterns": [],
+                "keep_patterns": [],  # Keep everything
+            },
+            # Test commands - summary important, verbose less so
+            "test": {
+                "patterns": ["pytest", "npm test", "cargo test", "go test", "jest", "vitest"],
+                "success_limit": 2000,
+                "failure_limit": 8000,
+                "noise_patterns": [
+                    r"^\.+$",  # Lines of dots (pytest progress)
+                    r"^PASSED",
+                    r"^\s*✓",  # Checkmarks
+                ],
+                "keep_patterns": ["FAILED", "FAIL", "Error", "error", "AssertionError", "Expected", "Actual"],
+            },
+            # Build commands
+            "build": {
+                "patterns": ["npm run build", "cargo build", "go build", "tsc", "webpack", "vite build"],
+                "success_limit": 1000,
+                "failure_limit": 6000,
+                "noise_patterns": [
+                    r"Compiling \S+",
+                    r"Finished \S+ target",
+                ],
+                "keep_patterns": ["error", "Error", "ERROR", "warning", "Warning"],
+            },
+            # Default for other shell commands
+            "default": {
+                "patterns": [],
+                "success_limit": 3000,
+                "failure_limit": 6000,
+                "noise_patterns": [],
+                "keep_patterns": [],
+            },
+        },
+        # File operation profiles
+        "read_file": {
+            "success_limit": 8000,
+            "failure_limit": 500,
+        },
+        "write_file": {
+            "success_limit": 300,  # Just confirmation
+            "failure_limit": 1000,
+        },
+        "edit_file": {
+            "success_limit": 300,
+            "failure_limit": 1000,
+        },
+        "list_files": {
+            "success_limit": 4000,
+            "failure_limit": 500,
+        },
+        "search_files": {
+            "success_limit": 4000,
+            "failure_limit": 500,
+        },
+        "search_code": {
+            "success_limit": 6000,
+            "failure_limit": 500,
+        },
+    }
+
     def __init__(
         self,
         project_root: str,
@@ -51,6 +173,9 @@ class ToolExecutor:
     ):
         self.project_root = Path(project_root).resolve()
         self.approval_callback = approval_callback
+
+        # Cache detected project type
+        self._project_type: Optional[str] = None
 
         # Tool registry
         self._tools: Dict[str, Callable] = {
@@ -97,12 +222,17 @@ class ToolExecutor:
         try:
             handler = self._tools[tool]
             result = await handler(**args)
+            # Tag output for all tools (shell already tagged internally)
+            if "_output_meta" not in result:
+                result = self._tag_tool_output(tool, result, args)
             return result
         except TypeError as e:
-            return {"error": f"Invalid arguments for {tool}: {e}"}
+            error_result = {"error": f"Invalid arguments for {tool}: {e}"}
+            return self._tag_tool_output(tool, error_result, args)
         except Exception as e:
             logger.exception(f"Tool execution error: {tool}")
-            return {"error": str(e)}
+            error_result = {"error": str(e)}
+            return self._tag_tool_output(tool, error_result, args)
 
     def _resolve_path(self, file_path: str) -> Path:
         """Resolve a path relative to project root."""
@@ -148,6 +278,230 @@ class ToolExecutor:
             return f"Search code index: {args.get('query', '?')}"
         else:
             return f"{tool}: {args}"
+
+    # =========================================================================
+    # Auto-lint/validation helpers
+    # =========================================================================
+
+    def _detect_project_type(self) -> Optional[str]:
+        """Detect project type based on config files."""
+        if self._project_type is not None:
+            return self._project_type
+
+        for marker, proj_type in self.PROJECT_MARKERS.items():
+            if (self.project_root / marker).exists():
+                self._project_type = proj_type
+                return proj_type
+
+        return None
+
+    def _get_lint_command(self, file_path: Path) -> Optional[str]:
+        """Get appropriate lint command for file type."""
+        ext = file_path.suffix.lower()
+        cmd_template = self.LINT_COMMANDS.get(ext)
+
+        if not cmd_template:
+            return None
+
+        # For node projects, check if eslint config exists
+        if ext in (".js", ".jsx", ".ts", ".tsx", ".mjs"):
+            project_type = self._detect_project_type()
+            if project_type != "node":
+                return None
+            # Check for eslint config
+            eslint_configs = [".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.yml", "eslint.config.js"]
+            has_eslint = any((self.project_root / cfg).exists() for cfg in eslint_configs)
+            if not has_eslint:
+                # Fallback to syntax check only
+                return None
+
+        return cmd_template.format(file=str(file_path))
+
+    async def _run_auto_lint(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        """
+        Run auto-lint on a file after write/edit.
+
+        Returns lint result dict or None if no linter available.
+        """
+        lint_cmd = self._get_lint_command(file_path)
+        if not lint_cmd:
+            return None
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    lint_cmd,
+                    shell=True,
+                    cwd=self.project_root,
+                    capture_output=True,
+                    timeout=self.LINT_TIMEOUT,
+                ),
+            )
+
+            stdout = result.stdout.decode("utf-8", errors="replace").strip()
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+
+            # Combine output
+            output = stdout or stderr
+
+            # Truncate if too long
+            if len(output) > 2000:
+                output = output[:2000] + "\n... (truncated)"
+
+            return {
+                "lint_passed": result.returncode == 0,
+                "lint_output": output if output else None,
+                "lint_command": lint_cmd.split()[0],  # Just show tool name
+            }
+
+        except subprocess.TimeoutExpired:
+            return {
+                "lint_passed": False,
+                "lint_output": "Lint timed out",
+                "lint_command": lint_cmd.split()[0],
+            }
+        except Exception as e:
+            logger.debug(f"Auto-lint failed: {e}")
+            return None
+
+    # =========================================================================
+    # Smart Output Filtering
+    # =========================================================================
+
+    def _detect_shell_command_type(self, command: str) -> str:
+        """Detect the type of shell command for smart filtering."""
+        cmd_lower = command.lower()
+        shell_profiles = self.TOOL_OUTPUT_PROFILES.get("shell", {})
+
+        for cmd_type, profile in shell_profiles.items():
+            if cmd_type == "default":
+                continue
+            patterns = profile.get("patterns", [])
+            for pattern in patterns:
+                if pattern.lower() in cmd_lower:
+                    return cmd_type
+
+        return "default"
+
+    def _filter_shell_output(
+        self,
+        output: str,
+        command: str,
+        success: bool,
+    ) -> Dict[str, Any]:
+        """
+        Smart filter shell output based on command type and success/failure.
+
+        Returns dict with filtered output and metadata.
+        """
+        import re
+
+        cmd_type = self._detect_shell_command_type(command)
+        shell_profiles = self.TOOL_OUTPUT_PROFILES.get("shell", {})
+        profile = shell_profiles.get(cmd_type, shell_profiles.get("default", {}))
+
+        # Get limits based on success/failure
+        limit = profile.get("success_limit", 3000) if success else profile.get("failure_limit", 6000)
+        noise_patterns = profile.get("noise_patterns", [])
+        keep_patterns = profile.get("keep_patterns", [])
+
+        lines = output.splitlines()
+        filtered_lines = []
+
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+
+            # Check if line matches keep patterns (always keep)
+            should_keep = False
+            if keep_patterns:
+                for pattern in keep_patterns:
+                    if re.search(pattern, line, re.IGNORECASE):
+                        should_keep = True
+                        break
+
+            # Check if line matches noise patterns (filter out)
+            is_noise = False
+            if noise_patterns and not should_keep:
+                for pattern in noise_patterns:
+                    if re.search(pattern, line):
+                        is_noise = True
+                        break
+
+            if should_keep or not is_noise:
+                filtered_lines.append(line)
+
+        filtered_output = "\n".join(filtered_lines)
+
+        # Apply length limit
+        was_truncated = False
+        if len(filtered_output) > limit:
+            filtered_output = filtered_output[:limit]
+            # Try to break at newline
+            last_newline = filtered_output.rfind("\n")
+            if last_newline > limit * 0.8:
+                filtered_output = filtered_output[:last_newline]
+            filtered_output += "\n... (truncated)"
+            was_truncated = True
+
+        return {
+            "output": filtered_output,
+            "command_type": cmd_type,
+            "original_lines": len(lines),
+            "filtered_lines": len(filtered_lines),
+            "truncated": was_truncated,
+            "limit_applied": limit,
+        }
+
+    def _tag_tool_output(
+        self,
+        tool: str,
+        result: Dict[str, Any],
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Tag tool output with metadata for smart handling downstream.
+
+        Adds:
+        - _output_meta: {tool, success, output_type, priority}
+        """
+        success = result.get("success", True) and "error" not in result
+
+        # Determine output type and priority
+        if tool == "shell":
+            cmd = args.get("command", "")
+            cmd_type = self._detect_shell_command_type(cmd)
+            output_type = f"shell_{cmd_type}"
+            # Priority: higher = more important to preserve
+            # Failures are higher priority than successes
+            # Run/test output more important than install
+            priority_map = {"run": 80, "test": 70, "build": 60, "install": 30, "default": 50}
+            base_priority = priority_map.get(cmd_type, 50)
+            priority = base_priority + (20 if not success else 0)
+        else:
+            output_type = tool
+            # File reads are high priority, write confirmations low
+            priority_map = {
+                "read_file": 80,
+                "search_code": 75,
+                "search_files": 70,
+                "list_files": 60,
+                "write_file": 30,
+                "edit_file": 30,
+            }
+            base_priority = priority_map.get(tool, 50)
+            priority = base_priority + (20 if not success else 0)
+
+        result["_output_meta"] = {
+            "tool": tool,
+            "success": success,
+            "output_type": output_type,
+            "priority": priority,
+        }
+
+        return result
 
     # Tool implementations
 
@@ -226,13 +580,20 @@ class ToolExecutor:
             # Write new content
             path.write_text(content, encoding="utf-8")
 
-            return {
+            result = {
                 "success": True,
                 "file_path": str(path.relative_to(self.project_root)),
                 "created": not existed,
                 "lines_written": len(content.splitlines()),
                 "bytes_written": len(content.encode("utf-8")),
             }
+
+            # Auto-lint the file
+            lint_result = await self._run_auto_lint(path)
+            if lint_result:
+                result.update(lint_result)
+
+            return result
 
         except Exception as e:
             return {"error": f"Write error: {e}"}
@@ -347,12 +708,19 @@ class ToolExecutor:
 
             path.write_text(new_content, encoding="utf-8")
 
-            return {
+            result = {
                 "success": True,
                 "file_path": str(path.relative_to(self.project_root)),
                 "replacements": replacements,
                 "total_occurrences": count,
             }
+
+            # Auto-lint the file
+            lint_result = await self._run_auto_lint(path)
+            if lint_result:
+                result.update(lint_result)
+
+            return result
 
         except Exception as e:
             return {"error": f"Edit error: {e}"}
@@ -681,34 +1049,49 @@ class ToolExecutor:
 
             stdout = result.stdout.decode("utf-8", errors="replace")
             stderr = result.stderr.decode("utf-8", errors="replace")
+            success = result.returncode == 0
 
-            # Truncate long output
-            max_output = 50000
-            stdout_truncated = len(stdout) > max_output
-            stderr_truncated = len(stderr) > max_output
+            # Combine stdout and stderr for smart filtering
+            combined_output = stdout
+            if stderr:
+                combined_output = f"{stdout}\n--- stderr ---\n{stderr}" if stdout else stderr
 
-            if stdout_truncated:
-                stdout = stdout[:max_output] + "\n... (truncated)"
-            if stderr_truncated:
-                stderr = stderr[:max_output] + "\n... (truncated)"
+            # Apply smart filtering based on command type
+            filter_result = self._filter_shell_output(combined_output, command, success)
 
-            return {
-                "success": result.returncode == 0,
+            shell_result = {
+                "success": success,
                 "exit_code": result.returncode,
-                "stdout": stdout,
-                "stderr": stderr,
+                "output": filter_result["output"],
                 "command": command,
+                "command_type": filter_result["command_type"],
                 "cwd": str(work_dir.relative_to(self.project_root)),
             }
 
+            # Add filtering metadata
+            if filter_result["truncated"] or filter_result["original_lines"] != filter_result["filtered_lines"]:
+                shell_result["_filter_info"] = {
+                    "original_lines": filter_result["original_lines"],
+                    "filtered_lines": filter_result["filtered_lines"],
+                    "truncated": filter_result["truncated"],
+                    "limit": filter_result["limit_applied"],
+                }
+
+            # Tag the output for downstream smart handling
+            return self._tag_tool_output("shell", shell_result, {"command": command})
+
         except subprocess.TimeoutExpired:
-            return {
+            error_result = {
                 "error": f"Command timed out after {cmd_timeout}s",
                 "command": command,
                 "timeout": True,
+                "success": False,
             }
+            return self._tag_tool_output("shell", error_result, {"command": command})
         except Exception as e:
-            return {
+            error_result = {
                 "error": f"Shell error: {e}",
                 "command": command,
+                "success": False,
             }
+            return self._tag_tool_output("shell", error_result, {"command": command})
