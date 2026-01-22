@@ -56,6 +56,7 @@ class ToolExecutor:
         self._tools: Dict[str, Callable] = {
             "read_file": self._read_file,
             "write_file": self._write_file,
+            "write_project": self._write_project,  # Multi-file write for greenfield
             "edit_file": self._edit_file,
             "delete_file": self._delete_file,
             "list_files": self._list_files,
@@ -235,6 +236,81 @@ class ToolExecutor:
 
         except Exception as e:
             return {"error": f"Write error: {e}"}
+
+    async def _write_project(
+        self,
+        files: list,
+        project_description: str = "",
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Write multiple files at once for greenfield project creation.
+
+        Args:
+            files: List of {path, content, description} dicts
+            project_description: Overall project description
+
+        Returns:
+            Summary of files written
+        """
+        if not files:
+            return {"error": "No files provided"}
+
+        results = []
+        errors = []
+        total_lines = 0
+        total_bytes = 0
+
+        for file_info in files:
+            if not isinstance(file_info, dict):
+                errors.append(f"Invalid file entry: {file_info}")
+                continue
+
+            file_path = file_info.get("path", "")
+            content = file_info.get("content", "")
+
+            if not file_path:
+                errors.append("File entry missing 'path'")
+                continue
+
+            path = self._resolve_path(file_path)
+
+            try:
+                # Create parent directories
+                path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Check if file exists
+                existed = path.exists()
+
+                # Write content
+                path.write_text(content, encoding="utf-8")
+
+                lines = len(content.splitlines())
+                bytes_written = len(content.encode("utf-8"))
+                total_lines += lines
+                total_bytes += bytes_written
+
+                results.append({
+                    "path": str(path.relative_to(self.project_root)),
+                    "created": not existed,
+                    "lines": lines,
+                    "bytes": bytes_written,
+                    "description": file_info.get("description", ""),
+                })
+
+            except Exception as e:
+                errors.append(f"{file_path}: {e}")
+
+        return {
+            "success": len(results) > 0,
+            "files_written": len(results),
+            "files_failed": len(errors),
+            "total_lines": total_lines,
+            "total_bytes": total_bytes,
+            "files": results,
+            "errors": errors if errors else None,
+            "project_description": project_description,
+        }
 
     async def _edit_file(
         self,

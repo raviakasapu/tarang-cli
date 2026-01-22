@@ -583,8 +583,9 @@ async def _run_stream_session(
         current_phase = None
         extra_instructions = []  # Queue of extra instructions from SPACE
 
-        # Initialize phase tracker for checklist display
-        phase_tracker = client.formatter.init_phase_tracker()
+        # Initialize phase tracker for checklist display (with project name for multi-project disambiguation)
+        client.formatter.set_project_name(project_path.name)
+        phase_tracker = client.formatter.init_phase_tracker(project_name=project_path.name)
 
         # Start keyboard monitoring
         keyboard.start()
@@ -828,6 +829,10 @@ async def _run_stream_session(
                     elif verbose:
                         ui.console.print("[dim]✓ Complete[/dim]")
 
+                    # Show tool call summary in verbose mode
+                    if verbose and client._tool_tracker:
+                        client._tool_tracker.show_summary()
+
             # Apply changes - stop keyboard monitor for clean prompts
             keyboard.stop()
 
@@ -885,8 +890,8 @@ async def _handle_continue(ui: TarangConsole, project_path: Path, creds: dict, i
     try:
         client = TarangAPIClient(
             base_url=creds.get("backend_url") or "https://api.tarang.dev",
-            token=creds.get("token", ""),
         )
+        client.token = creds.get("token", "")
 
         # Get recent sessions for this project
         sessions = await client.get_project_sessions(str(project_path), limit=5)
@@ -1014,8 +1019,8 @@ async def _check_recent_sessions(ui: TarangConsole, project_path: Path, creds: d
     try:
         client = TarangAPIClient(
             base_url=creds.get("backend_url") or "https://api.tarang.dev",
-            token=creds.get("token", ""),
         )
+        client.token = creds.get("token", "")
 
         sessions = await client.get_project_sessions(str(project_path), limit=3)
 
@@ -1049,8 +1054,8 @@ async def _show_project_sessions(ui: TarangConsole, project_path: Path) -> None:
     creds = auth.load_credentials() or {}
     client = TarangAPIClient(
         base_url=creds.get("backend_url") or "https://api.tarang.dev",
-        token=creds.get("token", ""),
     )
+    client.token = creds.get("token", "")
 
     ui.console.print("\n[bold]Previous Sessions[/bold]")
     ui.console.print(f"[dim]Project: {project_path}[/dim]\n")

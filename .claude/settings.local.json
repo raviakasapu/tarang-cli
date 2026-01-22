@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(tree:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(cat:*)",
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)"
     ]
   }
 }

@@ -1105,6 +1105,9 @@ class TarangStreamClient:
         self.console = Console()
         self.formatter = OutputFormatter(self.console, verbose=verbose)
 
+        # Tool call tracker for visibility (initialized per-session in execute())
+        self._tool_tracker = None
+
         # Session-level approval settings
         self._approve_all = False  # Approve all operations for this session
         self._approved_tools: set = set()  # Approved tool types (e.g., "write_file", "edit_file")
@@ -1144,6 +1147,9 @@ class TarangStreamClient:
         """
         # Reset cancellation flag for new execution
         self._cancelled = False
+
+        # Initialize tool tracker for this session
+        self._tool_tracker = self.formatter.init_tool_tracker()
 
         if not self.token:
             yield StreamEvent(
@@ -1274,9 +1280,13 @@ class TarangStreamClient:
 
         logger.info(f"[LOCAL] Executing tool: {tool} with args: {args} in {self.project_root}")
 
-        # Show progress indicator for read-only tools in compact mode
+        # Show progress indicator for read-only tools
         if not require_approval:
-            self.formatter.show_tool_progress(tool, args)
+            # In verbose mode, show numbered tool calls via tracker
+            if self.verbose and self._tool_tracker:
+                self._tool_tracker.show_progress(tool, args)
+            else:
+                self.formatter.show_tool_progress(tool, args)
 
         # Show tool request with Rich formatting (full preview for write operations)
         self.formatter.show_tool_request(tool, args, require_approval, description)
@@ -1331,6 +1341,13 @@ class TarangStreamClient:
 
         # Execute tool locally
         result = self._execute_tool(tool, args)
+
+        # Calculate duration
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Record in tool tracker for visibility
+        if self._tool_tracker:
+            self._tool_tracker.record_call(tool, args, result, duration_ms)
 
         # Send result via callback
         callback_url = f"{self.base_url}/api/callback"

@@ -19,5 +19,5 @@ Usage:
     tarang                              # Interactive mode
 """
 
-__version__ = "3.5.9"
+__version__ = "4.6.0"
 __author__ = "Tarang Team"

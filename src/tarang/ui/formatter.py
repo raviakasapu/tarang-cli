@@ -23,6 +23,134 @@ from rich.table import Table
 
 
 @dataclass
+class ToolCall:
+    """Record of a single tool call."""
+    tool: str
+    args: Dict[str, Any]
+    result: Optional[Dict[str, Any]] = None
+    duration_ms: int = 0
+
+
+@dataclass
+class ToolCallTracker:
+    """
+    Tracks all tool calls during a session for visibility.
+
+    Provides:
+    - Running count of calls by tool type
+    - Files read/written tracking
+    - Context accumulation stats
+    - Summary display at end of session
+    """
+    console: Console
+    calls: List[ToolCall] = field(default_factory=list)
+    files_read: List[str] = field(default_factory=list)
+    files_written: List[str] = field(default_factory=list)
+    total_lines_read: int = 0
+    total_chunks_retrieved: int = 0
+    search_queries: List[str] = field(default_factory=list)
+
+    def record_call(
+        self,
+        tool: str,
+        args: Dict[str, Any],
+        result: Optional[Dict[str, Any]] = None,
+        duration_ms: int = 0,
+    ) -> None:
+        """Record a tool call and update stats."""
+        call = ToolCall(tool=tool, args=args, result=result, duration_ms=duration_ms)
+        self.calls.append(call)
+
+        # Track files read
+        if tool == "read_file" and result:
+            file_path = args.get("file_path", "")
+            if file_path and file_path not in self.files_read:
+                self.files_read.append(file_path)
+            self.total_lines_read += result.get("lines", 0)
+
+        # Track batch reads
+        elif tool == "read_files" and result:
+            for f in result.get("files", []):
+                path = f.get("path", "")
+                if path and path not in self.files_read:
+                    self.files_read.append(path)
+                self.total_lines_read += f.get("lines", 0)
+
+        # Track search_code results
+        elif tool == "search_code" and result:
+            query = args.get("query", "")
+            if query:
+                self.search_queries.append(query)
+            self.total_chunks_retrieved += len(result.get("chunks", []))
+
+        # Track files written
+        elif tool in ("write_file", "edit_file") and result and result.get("success"):
+            file_path = args.get("file_path", "")
+            if file_path and file_path not in self.files_written:
+                self.files_written.append(file_path)
+
+    def show_progress(self, tool: str, args: Dict[str, Any]) -> None:
+        """Show compact progress line for current tool."""
+        call_num = len(self.calls) + 1
+
+        if tool == "read_file":
+            target = args.get("file_path", "")[-40:]
+            self.console.print(f"  [dim]#{call_num} 📖 {target}[/dim]")
+        elif tool == "read_files":
+            count = len(args.get("file_paths", []))
+            self.console.print(f"  [dim]#{call_num} 📖 Reading {count} files...[/dim]")
+        elif tool == "search_code":
+            query = args.get("query", "")[:30]
+            self.console.print(f"  [dim]#{call_num} 🔎 Searching: \"{query}\"[/dim]")
+        elif tool == "list_files":
+            path = args.get("path", ".")
+            self.console.print(f"  [dim]#{call_num} 📂 Listing {path}[/dim]")
+        elif tool == "shell":
+            cmd = args.get("command", "")[:40].replace("\n", " ")
+            self.console.print(f"  [dim]#{call_num} 💻 {cmd}[/dim]")
+
+    def show_summary(self) -> None:
+        """Show summary of all tool calls at end of session."""
+        if not self.calls:
+            return
+
+        # Count by tool type
+        tool_counts: Dict[str, int] = {}
+        for call in self.calls:
+            tool_counts[call.tool] = tool_counts.get(call.tool, 0) + 1
+
+        # Build summary table
+        table = Table(title="Tool Call Summary", box=None, padding=(0, 1))
+        table.add_column("Tool", style="cyan")
+        table.add_column("Count", justify="right")
+        table.add_column("Details", style="dim")
+
+        for tool, count in sorted(tool_counts.items()):
+            details = ""
+            if tool == "read_file":
+                details = f"{self.total_lines_read} lines"
+            elif tool == "search_code":
+                details = f"{self.total_chunks_retrieved} chunks"
+            table.add_row(tool, str(count), details)
+
+        self.console.print()
+        self.console.print(table)
+
+        # Files summary
+        if self.files_read:
+            self.console.print(f"\n[dim]Files read ({len(self.files_read)}):[/dim]")
+            for f in self.files_read[:10]:
+                self.console.print(f"  [dim]• {f}[/dim]")
+            if len(self.files_read) > 10:
+                self.console.print(f"  [dim]... and {len(self.files_read) - 10} more[/dim]")
+
+        if self.files_written:
+            self.console.print(f"\n[green]Files modified ({len(self.files_written)}):[/green]")
+            for f in self.files_written:
+                self.console.print(f"  [green]• {f}[/green]")
+
+
+@dataclass
 class PhaseStatus:
     """Status of a single phase in the plan."""
     name: str
@@ -49,6 +177,7 @@ class PhaseTracker:
     current_phase_index: int = 0
     current_worker: str = ""
     tool_count: int = 0
+    project_name: str = ""  # For multi-project disambiguation
 
     def set_plan(self, plan: dict) -> None:
         """Initialize tracker with orchestrator's plan. Renders ONCE."""
@@ -151,9 +280,14 @@ class PhaseTracker:
         # Clear previous output and render fresh
         lines = []
 
+        # Project prefix for multi-project disambiguation
+        project_prefix = ""
+        if self.project_name:
+            project_prefix = f"[dim magenta][{self.project_name}][/dim magenta] "
+
         # Title
         if self.prd_title:
-            lines.append(f"[bold blue]📋 {self.prd_title}[/bold blue]")
+            lines.append(f"{project_prefix}[bold blue]📋 {self.prd_title}[/bold blue]")
             lines.append("")
 
         # Phase checklist
@@ -199,11 +333,19 @@ class PhaseTracker:
                 tool_info = f" ({self.tool_count} tools)" if self.tool_count > 0 else ""
                 lines.append(f"      [dim]→ {phase.current_step}{tool_info}[/dim]")
 
-        # Progress summary
+        # Progress summary - show current phase position, not just completed count
         completed = sum(1 for p in self.phases if p.status == "completed")
+        running = sum(1 for p in self.phases if p.status == "running")
         total = len(self.phases)
         lines.append("")
-        lines.append(f"  [dim]Progress: {completed}/{total} phases[/dim]")
+
+        if running > 0:
+            # Show which phase we're on: "Phase 2/3 (1 completed)"
+            current_phase = completed + 1  # 1-indexed
+            lines.append(f"  [dim]Phase {current_phase}/{total} ({completed} completed)[/dim]")
+        else:
+            # All done or not started
+            lines.append(f"  [dim]Progress: {completed}/{total} phases[/dim]")
 
         # Print all lines
         self.console.print("\n".join(lines))
@@ -305,11 +447,30 @@ class OutputFormatter:
         self._pending_tool: Optional[Dict[str, Any]] = None
         # Phase tracker for checklist display
         self.phase_tracker: Optional[PhaseTracker] = None
+        # Tool call tracker for visibility
+        self.tool_tracker: Optional[ToolCallTracker] = None
+        # Project name for multi-project disambiguation
+        self.project_name: str = ""
 
-    def init_phase_tracker(self) -> PhaseTracker:
+    def set_project_name(self, name: str) -> None:
+        """Set project name for output prefixing."""
+        self.project_name = name
+
+    def _get_prefix(self) -> str:
+        """Get project prefix for output lines."""
+        if self.project_name:
+            return f"[dim magenta][{self.project_name}][/dim magenta] "
+        return ""
+
+    def init_phase_tracker(self, project_name: str = "") -> PhaseTracker:
         """Initialize and return a phase tracker for this session."""
-        self.phase_tracker = PhaseTracker(console=self.console)
+        self.phase_tracker = PhaseTracker(console=self.console, project_name=project_name)
         return self.phase_tracker
+
+    def init_tool_tracker(self) -> ToolCallTracker:
+        """Initialize and return a tool call tracker for this session."""
+        self.tool_tracker = ToolCallTracker(console=self.console)
+        return self.tool_tracker
 
     def _get_language(self, file_path: str) -> str:
         """Detect language from file extension."""
@@ -673,12 +834,13 @@ class OutputFormatter:
             action_padded = action.ljust(self.ACTION_WIDTH)
             left = f"  [{color}]✓ {icon} {action_padded}[/{color}]"
 
-        # Print with stats right-aligned
+        # Print with stats right-aligned (add project prefix for multi-project disambiguation)
+        prefix = self._get_prefix()
         if stats:
             # Use Rich's Text for proper alignment with markup
-            self.console.print(f"{left:<{self.LINE_WIDTH}} {stats}")
+            self.console.print(f"{prefix}{left:<{self.LINE_WIDTH}} {stats}")
         else:
-            self.console.print(left)
+            self.console.print(f"{prefix}{left}")
 
     def _show_read_file_result(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Display read_file result with line count."""
